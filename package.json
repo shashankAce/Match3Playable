@@ -1,0 +1,42 @@
+{
+  "name": "match3-playable",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "preview": "vite preview",
+    "build": "vite build",
+    "build:notrim": "vite build --mode notrim",
+    "build:debug": "vite build --mode debug",
+    "clean": "rm -rf build",
+    "types": "tsc --noEmit",
+    "pack:facebook": "node engine/bin/pack-platform.js --platform=facebook",
+    "pack:facebook:init": "node engine/bin/pack-platform.js --platform=facebook --init",
+    "pack:telegram": "node engine/bin/pack-platform.js --platform=telegram",
+    "pack:telegram:init": "node engine/bin/pack-platform.js --platform=telegram --init",
+    "pack:youtube": "node engine/bin/pack-platform.js --platform=youtube",
+    "pack:youtube:init": "node engine/bin/pack-platform.js --platform=youtube --init",
+    "pack:google-playables": "node engine/bin/pack-platform.js --platform=google-playables --orientation=portrait",
+    "pack:google-playables:init": "node engine/bin/pack-platform.js --platform=google-playables --init",
+    "pack:meta-playables": "node engine/bin/pack-platform.js --platform=meta-playables",
+    "pack:meta-playables:init": "node engine/bin/pack-platform.js --platform=meta-playables --init",
+    "pack:applovin-playables": "node engine/bin/pack-platform.js --platform=applovin-playables",
+    "pack:applovin-playables:init": "node engine/bin/pack-platform.js --platform=applovin-playables --init",
+    "pack:unity-playables": "node engine/bin/pack-platform.js --platform=unity-playables",
+    "pack:unity-playables:init": "node engine/bin/pack-platform.js --platform=unity-playables --init",
+    "pack:standalone": "node engine/bin/pack-platform.js --platform=standalone",
+    "pack:standalone:init": "node engine/bin/pack-platform.js --platform=standalone --init"
+  },
+  "dependencies": {
+    "earcut": "^3.2.3"
+  },
+  "devDependencies": {
+    "@types/node": "^22.0.0",
+    "@webgpu/types": "^0.1.71",
+    "maxrects-packer": "^2.7.3",
+    "sharp": "^0.35.3",
+    "typescript": "^6.0.3",
+    "vite": "^8.1.4"
+  }
+}

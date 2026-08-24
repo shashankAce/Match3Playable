@@ -1,0 +1,28 @@
+{
+  "compilerOptions": {
+    "target": "ESNext",
+    "module": "ESNext",
+    "moduleResolution": "Bundler",
+    "allowJs": true,
+    "types": [
+      "node",
+      "@webgpu/types",
+      "vite/client"
+    ],
+    "skipLibCheck": true,
+    "strictNullChecks": false,
+    "allowImportingTsExtensions": true,
+    "noEmit": true,
+    "paths": {
+      "noonengine": [
+        "./engine/lib/index.js"
+      ]
+    }
+  },
+  "include": [
+    "src/**/*"
+  ],
+  "exclude": [
+    "node_modules"
+  ]
+}
