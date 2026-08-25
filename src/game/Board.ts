@@ -42,6 +42,14 @@ export interface ColumnMove {
  */
 type PendingAction =
     | { kind: 'burst'; r: number; c: number; radius: number }
+    /**
+     * A specific bystander special discovered mid-chain this phase, but deliberately left
+     * uncleared (see `_expandCaught`'s doc) so it's still there next `resolve()` call — "position,
+     * not necessarily the same reason it's there," same convention `'burst'` already uses:
+     * activates whatever special (if any) `this.specials` reports at `(r,c)` when this drains, a
+     * no-op if it fell away or was cleared by something else before then.
+     */
+    | { kind: 'activate'; r: number; c: number }
     | { kind: 'colorSweep'; excludeTypeId: number };
 
 export interface ResolveResult {
@@ -64,7 +72,7 @@ export interface ResolveResult {
     spawned: { r: number; c: number; special: SpecialKind; typeId: number }[];
     /**
      * Every special that actually detonated this pass — a bystander caught
-     * in `_floodDetonate`'s chain reaction, or the deliberate swap target(s)
+     * in `_catchBystanders`'s chain reaction, or the deliberate swap target(s)
      * in `activateSpecialSwap` — each with position/kind/color captured
      * before its cell is cleared. Lets a renderer play a distinct effect per
      * special kind without guessing from `cleared` alone.
@@ -251,37 +259,97 @@ export class Board {
         const toClear = forcedClear;
         const spawned: { r: number; c: number; special: SpecialKind; typeId: number }[] = [];
 
+        /**
+         * Records a new spawn and — critically — registers it into
+         * `this.specials` immediately, *before* `_catchBystanders` runs
+         * below, not after. This is what makes a newly created special
+         * behave correctly if another effect in this same pass (e.g. a
+         * bystander special elsewhere in this same run) ends up touching its
+         * cell: `_catchBystanders`/`_expandCaught` treat anything they find
+         * in `this.specials` as a caught special regardless of when it was
+         * registered, so the new one gets swept into the same "caught
+         * bystander" handling as any other — destroyed immediately if it's
+         * part of the *original* snapshot (e.g. the bystander sits in the
+         * same matched run), or left untouched and deferred to its own next-
+         * phase beat otherwise — matching real Candy Crush's behavior of
+         * destroying (not protecting) a newly created special caught by
+         * another special's explosion, never in a single flattened instant.
+         * If its cell is never touched at all, this registration is simply
+         * its permanent one.
+         */
+        const registerSpawn = (r: number, c: number, special: SpecialKind, typeId: number): void => {
+            spawned.push({ r, c, special, typeId });
+            this.specials.set(Board.key(r, c), special);
+        };
+
         // Merge same-typeId h/v run pairs sharing a cell into a wrapped spawn;
         // otherwise a 4+ run spawns striped; a plain 3-run just clears.
         const hRuns = runs.filter(r => r.orientation === 'h');
         const vRuns = runs.filter(r => r.orientation === 'v');
         const consumedV = new Set<number>();
+        /**
+         * A run that loses a length-priority conflict (see below) is added
+         * here, not to `toClear` — it's left completely untouched this
+         * phase, exactly as if it never matched at all. Whatever's left of
+         * it (minus whatever the winning run's own clear happens to take)
+         * sits on the board through gravity/refill and gets a fresh,
+         * unbiased look from `_findRuns()` on the *next* `resolve()` call —
+         * rather than this phase guessing whether some sub-segment of the
+         * stale, pre-clear run is still a genuine 3+ match, which it may not
+         * be once the shared cell is gone. `hRuns` never needs the same
+         * treatment: a losing h-run just falls through to its own
+         * length-based branch below, which independently decides its own
+         * fate without knowing about `v` at all — see the loop body.
+         */
+        const skippedV = new Set<number>();
 
         for (const h of hRuns) {
             let merged = false;
+            let hLoses = false;
             for (let vi = 0; vi < vRuns.length; vi++) {
-                if (consumedV.has(vi)) continue;
+                if (consumedV.has(vi) || skippedV.has(vi)) continue;
                 const v = vRuns[vi];
                 if (v.typeId !== h.typeId) continue;
                 const intersection = h.cells.find(hc => v.cells.some(vc => vc.r === hc.r && vc.c === hc.c));
                 if (!intersection) continue;
 
-                for (const cell of h.cells) toClear.add(Board.key(cell.r, cell.c));
-                for (const cell of v.cells) toClear.add(Board.key(cell.r, cell.c));
-                toClear.delete(Board.key(intersection.r, intersection.c));
-                spawned.push({ r: intersection.r, c: intersection.c, special: 'wrapped', typeId: h.typeId });
+                const hWorthyOfBomb = h.cells.length >= rules.special.colorBombMatchLength;
+                const vWorthyOfBomb = v.cells.length >= rules.special.colorBombMatchLength;
 
-                consumedV.add(vi);
-                merged = true;
-                break;
+                if (!hWorthyOfBomb && !vWorthyOfBomb) {
+                    // Neither side is Color-Bomb-worthy on its own — genuine
+                    // L/T merge, same as always.
+                    for (const cell of h.cells) toClear.add(Board.key(cell.r, cell.c));
+                    for (const cell of v.cells) toClear.add(Board.key(cell.r, cell.c));
+                    toClear.delete(Board.key(intersection.r, intersection.c));
+                    registerSpawn(intersection.r, intersection.c, 'wrapped', h.typeId);
+                    consumedV.add(vi);
+                    merged = true;
+                } else if (hWorthyOfBomb && !vWorthyOfBomb) {
+                    // h wins — v (short on its own) is left entirely alone
+                    // this phase; h falls through to its own color-bomb
+                    // branch below undisturbed.
+                    skippedV.add(vi);
+                } else if (!hWorthyOfBomb && vWorthyOfBomb) {
+                    // v wins — h (short on its own) is left entirely alone
+                    // this phase; v will independently reach its own
+                    // color-bomb branch below via the normal `vRuns.forEach`.
+                    hLoses = true;
+                }
+                // Both worthy: neither is skipped, both independently reach
+                // their own color-bomb branch below — if they'd spawn on the
+                // exact same shared cell, `_pickSpawnCell`'s existing
+                // already-special check (see its own doc) already makes the
+                // second one pick a different cell instead of colliding.
+                break; // only one crossing partner considered per run
             }
-            if (merged) continue;
+            if (merged || hLoses) continue;
 
             if (h.cells.length >= rules.special.colorBombMatchLength) {
                 const spawnAt = this._pickSpawnCell(h.cells, preferredCells);
                 for (const cell of h.cells) toClear.add(Board.key(cell.r, cell.c));
                 toClear.delete(Board.key(spawnAt.r, spawnAt.c));
-                spawned.push({ r: spawnAt.r, c: spawnAt.c, special: 'color-bomb', typeId: h.typeId });
+                registerSpawn(spawnAt.r, spawnAt.c, 'color-bomb', h.typeId);
                 this.cells[spawnAt.r][spawnAt.c] = COLOR_BOMB_TYPE_ID;
             } else if (h.cells.length >= rules.special.stripedMatchLength) {
                 const spawnAt = this._pickSpawnCell(h.cells, preferredCells);
@@ -289,19 +357,19 @@ export class Board {
                 toClear.delete(Board.key(spawnAt.r, spawnAt.c));
                 // Perpendicular to the match: a horizontal run spawns the
                 // vertical-look tile (clears the column) — see `_areaFor`'s doc.
-                spawned.push({ r: spawnAt.r, c: spawnAt.c, special: 'striped-v', typeId: h.typeId });
+                registerSpawn(spawnAt.r, spawnAt.c, 'striped-v', h.typeId);
             } else {
                 for (const cell of h.cells) toClear.add(Board.key(cell.r, cell.c));
             }
         }
 
         vRuns.forEach((v, vi) => {
-            if (consumedV.has(vi)) return;
+            if (consumedV.has(vi) || skippedV.has(vi)) return;
             if (v.cells.length >= rules.special.colorBombMatchLength) {
                 const spawnAt = this._pickSpawnCell(v.cells, preferredCells);
                 for (const cell of v.cells) toClear.add(Board.key(cell.r, cell.c));
                 toClear.delete(Board.key(spawnAt.r, spawnAt.c));
-                spawned.push({ r: spawnAt.r, c: spawnAt.c, special: 'color-bomb', typeId: v.typeId });
+                registerSpawn(spawnAt.r, spawnAt.c, 'color-bomb', v.typeId);
                 this.cells[spawnAt.r][spawnAt.c] = COLOR_BOMB_TYPE_ID;
             } else if (v.cells.length >= rules.special.stripedMatchLength) {
                 const spawnAt = this._pickSpawnCell(v.cells, preferredCells);
@@ -309,14 +377,42 @@ export class Board {
                 toClear.delete(Board.key(spawnAt.r, spawnAt.c));
                 // Perpendicular to the match: a vertical run spawns the
                 // horizontal-look tile (clears the row) — see `_areaFor`'s doc.
-                spawned.push({ r: spawnAt.r, c: spawnAt.c, special: 'striped-h', typeId: v.typeId });
+                registerSpawn(spawnAt.r, spawnAt.c, 'striped-h', v.typeId);
             } else {
                 for (const cell of v.cells) toClear.add(Board.key(cell.r, cell.c));
             }
         });
 
-        const activatedSpecials = [...forcedActivated, ...this._floodDetonate(toClear)];
+        // A spawn cell is protected from `toClear` at the moment it's chosen
+        // above, but a *different*, un-merged crossing run sharing that same
+        // cell (the exact case the length-priority check above can produce —
+        // a Color-Bomb-worthy run and a shorter perpendicular run crossing at
+        // one cell) processes independently afterward and would otherwise
+        // re-add it via its own plain `toClear.add(cell)` loop, silently
+        // erasing the special the instant it's created. Re-asserting every
+        // spawn's protection here, after both loops have fully run,
+        // guarantees it sticks regardless of processing order.
+        for (const s of spawned) toClear.delete(Board.key(s.r, s.c));
 
+        const activatedSpecials = [...forcedActivated, ...this._catchBystanders(toClear)];
+
+        return this._finalizeClear(toClear, activatedSpecials, null, spawned);
+    }
+
+    /**
+     * Shared tail for both `resolve()` and `activateSpecialSwap()`: scores,
+     * clears cells, drops any spawned special whose cell ended up in
+     * `toClear` after all (see `registerSpawn`'s doc — a freshly-spawned
+     * special caught within this same phase's own snapshot is destroyed, not
+     * protected, matching real Candy Crush), runs gravity/refill, and builds
+     * the `ResolveResult`.
+     */
+    private _finalizeClear(
+        toClear: Set<string>,
+        activatedSpecials: { r: number; c: number; kind: SpecialKind; typeId: number }[],
+        colorBombBeam: ResolveResult['colorBombBeam'],
+        spawned: { r: number; c: number; special: SpecialKind; typeId: number }[] = []
+    ): ResolveResult {
         const scoreDelta = toClear.size * rules.scoring.pointsPerTile;
 
         const cleared: { r: number; c: number; typeId: number }[] = [];
@@ -326,13 +422,11 @@ export class Board {
             this.cells[r][c] = -1;
             this.specials.delete(k);
         }
-        for (const s of spawned) {
-            this.specials.set(Board.key(s.r, s.c), s.special);
-        }
+        const survivingSpawned = spawned.filter(s => !toClear.has(Board.key(s.r, s.c)));
 
         const moves = this._collapseAndRefill();
 
-        return { cleared, spawned, activatedSpecials, colorBombBeam: null, scoreDelta, moves };
+        return { cleared, spawned: survivingSpawned, activatedSpecials, colorBombBeam, scoreDelta, moves };
     }
 
     /**
@@ -342,10 +436,16 @@ export class Board {
      * `PendingAction`'s own doc for why these exist. A `'colorSweep'` re-queues
      * a `'burst'` per swept cell (its own second explosion), so a Wrapped +
      * Color Bomb combo's second wave follows the same "always double-detonate"
-     * rule as any other wrapped detonation.
+     * rule as any other wrapped detonation. `'activate'` runs the caught
+     * special through `_expandCaught` the same as `_catchBystanders` does, via
+     * a `seen`/`deferred` pair scoped to this one drain call — not a simpler
+     * "just dump the whole area in" path — so anything *it* in turn catches
+     * defers to yet another phase instead of flattening back into this one.
      */
     private _drainPending(): { toClear: Set<string>; activated: { r: number; c: number; kind: SpecialKind; typeId: number }[] } {
         const toClear = new Set<string>();
+        const seen = new Set<string>();
+        const deferred = new Set<string>();
         const activated: { r: number; c: number; kind: SpecialKind; typeId: number }[] = [];
         const pending = this._pending;
         this._pending = [];
@@ -356,6 +456,14 @@ export class Board {
                     toClear.add(Board.key(cell.r, cell.c));
                 }
                 activated.push({ r: action.r, c: action.c, kind: 'wrapped', typeId: this.cells[action.r][action.c] });
+            } else if (action.kind === 'activate') {
+                const key = Board.key(action.r, action.c);
+                const kind = this.specials.get(key);
+                if (!kind || kind === 'color-bomb') continue; // fell away, or never chain-reacts — nothing to do
+                toClear.add(key);
+                seen.add(key);
+                activated.push({ r: action.r, c: action.c, kind, typeId: this.cells[action.r][action.c] });
+                this._expandCaught(kind, action.r, action.c, toClear, seen, deferred);
             } else {
                 const candidates: number[] = [];
                 for (let t = 0; t < this.typeCount; t++) {
@@ -390,7 +498,7 @@ export class Board {
      * forms, so `BoardView._attemptSwap` routes that case through the normal
      * `swap()`/`hasAnyMatch()`/`resolve()` path instead, where a match run
      * that happens to include the special's cell picks it up for free via
-     * `resolve()`'s `_floodDetonate` bystander logic. `s1`/`s2` must be read
+     * `resolve()`'s `_catchBystanders` bystander logic. `s1`/`s2` must be read
      * (via `getSpecialAt`) *before* calling `swap()`, since this method reads
      * `cells[r1][c1]`/`cells[r2][c2]` directly rather than requiring the
      * positional swap to have already been committed to the model.
@@ -473,6 +581,10 @@ export class Board {
                     if (!this.inBounds(r1, cc)) continue;
                     for (let rr = 0; rr < this.rows; rr++) toClear.add(Board.key(rr, cc));
                 }
+                // This combo involves a wrapped tile too — every wrapped
+                // detonation always double-explodes, same as `bothWrapped`
+                // above; this one was previously missing its second blast.
+                this._pending.push({ kind: 'burst', r: r1, c: c1, radius: w });
             }
         }
         // (No fallback branch: per this method's precondition, it's only ever
@@ -483,77 +595,120 @@ export class Board {
         // The two swapped cells are deliberate participants, already fully
         // accounted for above (including, for the color-bomb branches, using
         // `otherSpecial`'s area) — remove their own map entries *before*
-        // flooding so they aren't also treated as incidentally-caught
-        // bystanders re-contributing their own base area a second time.
+        // catching bystanders so they aren't also treated as incidentally-
+        // caught bystanders re-contributing their own base area a second time.
         this.specials.delete(Board.key(r1, c1));
         this.specials.delete(Board.key(r2, c2));
-        activatedSpecials.push(...this._floodDetonate(toClear));
+        // `toClear` at this point already holds every cell this combo
+        // deliberately, immediately affects (both participants, plus — for
+        // the color-bomb branches — every same-color/synthetic-shape cell
+        // built above) — passing the whole thing as `_catchBystanders`'s
+        // snapshot treats all of it as "this phase," and only a genuinely
+        // different special incidentally caught within that blast (not one
+        // of this combo's own deliberate cells) defers to the next phase.
+        activatedSpecials.push(...this._catchBystanders(toClear));
 
-        const scoreDelta = toClear.size * rules.scoring.pointsPerTile;
-        const cleared: { r: number; c: number; typeId: number }[] = [];
-        for (const k of toClear) {
-            const [r, c] = k.split(',').map(Number);
-            cleared.push({ r, c, typeId: this.cells[r][c] });
-            this.cells[r][c] = -1;
-            this.specials.delete(k);
-        }
-
-        const moves = this._collapseAndRefill();
-
-        return { cleared, spawned: [], activatedSpecials, colorBombBeam, scoreDelta, moves };
+        return this._finalizeClear(toClear, activatedSpecials, colorBombBeam);
     }
 
     /**
-     * Expands `toClear` in place with the line/area of any existing special
-     * caught in the blast, repeating until stable, and returns each such
-     * special's position/kind/color (captured pre-clear) so a renderer can
-     * play its detonation effect. A Color Bomb caught passively (not
-     * deliberately swapped) is just a bystander — it doesn't chain its own
-     * effect. `seen` dedupes against the same key being revisited on a later
-     * outer pass (its own detonation area is idempotent to re-add, but it
-     * must only be reported once). A wrapped tile caught here — whether a
-     * genuine bystander, or the deliberate-swap-activation case where a lone
-     * wrapped tile happens to complete a match of its own color (see
-     * `activateSpecialSwap`'s doc) — always queues a second explosion at the
-     * same spot for the next `resolve()` pass, per candy_crush_rules.md.
+     * Merges one activating special's own declared area (`_areaFor`) into
+     * `toClear` — the atomic, instant consequence of it going off, all in
+     * this one phase (matches how a striped candy's activation reads as one
+     * beat, not a slow reveal). `seen` is every cell already decided as
+     * active this same phase (the caller's snapshot, plus this special's own
+     * key); a newly-touched cell already in `toClear` or `seen` merges
+     * directly — it's already part of this phase for some other reason, not
+     * a new discovery.
+     *
+     * A newly-touched cell that isn't already decided but *does* hold a
+     * different special is the actual "next domino": rather than expanding
+     * it right here (which is what used to flatten an entire chain reaction
+     * into one instantaneous blob), it's left **completely untouched** —
+     * not added to `toClear`, not cleared, not moved by gravity this pass —
+     * and a `{kind:'activate', r, c}` is queued instead, so `_drainPending`'s
+     * lookup on the *next* `resolve()` call is guaranteed to still find it
+     * exactly where it is. `deferred` dedupes that queuing per call: if two
+     * different catches this phase both reach the same not-yet-decided cell,
+     * it's only queued once (otherwise a caught wrapped tile could end up
+     * double-reburst-queued from two directions).
+     *
+     * `kind === 'wrapped'` additionally queues its own unconditional next-
+     * phase `'burst'` re-detonation (self, not defer-checked against another
+     * special) — the guaranteed always-double-explodes rule, unaffected by
+     * any of the above.
      */
-    private _floodDetonate(toClear: Set<string>): { r: number; c: number; kind: SpecialKind; typeId: number }[] {
+    private _expandCaught(kind: SpecialKind, r: number, c: number, toClear: Set<string>, seen: Set<string>, deferred: Set<string>): void {
+        if (kind === 'wrapped') {
+            this._pending.push({ kind: 'burst', r, c, radius: rules.special.wrappedRadius });
+        }
+        for (const cell of this._areaFor(kind, r, c)) {
+            const ek = Board.key(cell.r, cell.c);
+            if (toClear.has(ek) || seen.has(ek)) {
+                toClear.add(ek);
+                continue;
+            }
+            const otherKind = this.specials.get(ek);
+            if (!otherKind) {
+                toClear.add(ek);
+            } else if (!deferred.has(ek)) {
+                deferred.add(ek);
+                this._pending.push({ kind: 'activate', r: cell.r, c: cell.c });
+            }
+            // else: a different special, already deferred by another catch
+            // this same phase — left untouched, already queued.
+        }
+    }
+
+    /**
+     * Single pass (not a recursive flood-fill) over a snapshot of `toClear`
+     * as it stands right now: every cell already queued to clear that holds
+     * a special (a Color Bomb caught passively is just a bystander — it
+     * doesn't chain its own effect) activates immediately via
+     * `_expandCaught`, contributing its own area to *this* phase. Anything
+     * *that* newly reveals gets deferred to the next `resolve()` call
+     * instead of being expanded further here — see `_expandCaught`'s doc for
+     * why. This is what turns a chain of catches into a sequence of separate
+     * visual beats (one per `resolve()` call) instead of one flattened blast.
+     */
+    private _catchBystanders(toClear: Set<string>): { r: number; c: number; kind: SpecialKind; typeId: number }[] {
         const activated: { r: number; c: number; kind: SpecialKind; typeId: number }[] = [];
         const seen = new Set<string>();
-        let grew = true;
-        while (grew) {
-            grew = false;
-            for (const k of Array.from(toClear)) {
-                const kind = this.specials.get(k);
-                if (!kind || kind === 'color-bomb') continue;
-                const [r, c] = k.split(',').map(Number);
-                if (!seen.has(k)) {
-                    seen.add(k);
-                    activated.push({ r, c, kind, typeId: this.cells[r][c] });
-                    if (kind === 'wrapped') {
-                        this._pending.push({ kind: 'burst', r, c, radius: rules.special.wrappedRadius });
-                    }
-                }
-                const extra = this._areaFor(kind, r, c);
-                for (const cell of extra) {
-                    const ek = Board.key(cell.r, cell.c);
-                    if (!toClear.has(ek)) {
-                        toClear.add(ek);
-                        grew = true;
-                    }
-                }
-            }
+        const deferred = new Set<string>();
+        for (const k of Array.from(toClear)) {
+            const kind = this.specials.get(k);
+            if (!kind || kind === 'color-bomb' || seen.has(k)) continue;
+            seen.add(k);
+            const [r, c] = k.split(',').map(Number);
+            activated.push({ r, c, kind, typeId: this.cells[r][c] });
+            this._expandCaught(kind, r, c, toClear, seen, deferred);
         }
         return activated;
     }
 
-    /** A preferred cell that's part of `cells` wins; otherwise falls back to the run's middle. */
+    /**
+     * A preferred cell that's part of `cells` wins, provided it isn't already
+     * occupied by an existing special; otherwise the first special-free cell
+     * in `cells`; otherwise (every cell in the run already holds a special —
+     * rare) falls back to the run's middle regardless. Never picks an
+     * already-special cell while a special-free one is available: spawning
+     * the new special there would silently overwrite whatever bystander
+     * special was already sitting on it (its own `this.specials` entry gets
+     * clobbered by `spawned`'s write in `resolve()`) *before* `_catchBystanders`
+     * ever gets a chance to see it in `toClear` and activate it — the
+     * pre-existing special would vanish having never burst. This bites
+     * specifically when the player swaps the special tile itself into a
+     * match (its own new cell is a `preferred` swap destination), not the
+     * plain-bystander case where the special sits elsewhere in the run
+     * untouched by the swap (see `debugLayouts.ts`'s `stripedBystanderCatch`).
+     */
     private _pickSpawnCell(cells: CellPos[], preferred?: CellPos[]): CellPos {
+        const free = (p: CellPos): boolean => !this.specials.has(Board.key(p.r, p.c));
         if (preferred) {
-            const hit = preferred.find(p => cells.some(c => c.r === p.r && c.c === p.c));
+            const hit = preferred.find(p => free(p) && cells.some(c => c.r === p.r && c.c === p.c));
             if (hit) return hit;
         }
-        return cells[Math.floor(cells.length / 2)];
+        return cells.find(free) ?? cells[Math.floor(cells.length / 2)];
     }
 
     /**

@@ -37,6 +37,29 @@ const colorBombReady: DebugLayout = {
 };
 
 /**
+ * Same 5-in-a-row as `colorBombReady` (swap (4,2) <-> (5,2)), but this time
+ * col 2 also already has type-0 candies at rows 2-3 — so completing the row
+ * doesn't just finish a 5-match, it also completes a *crossing* 3-in-a-column
+ * at the same cell (4,2), the same L/T shape that normally produces a
+ * Wrapped Candy. A Color Bomb-worthy run always outranks being folded into
+ * an L/T merge (`Board.resolve()`'s hRuns/vRuns loop skips the merge
+ * whenever either crossing run is already long enough for its own Color
+ * Bomb) — this spawns a **Color Bomb** at (4,2), not a Wrapped Candy, even
+ * though the crossing 3-in-a-column would otherwise have produced one. Was a
+ * confirmed bug (spawned Wrapped instead) before that priority check existed.
+ */
+const colorBombBeatsWrapped: DebugLayout = {
+    cells: (() => {
+        const grid = checkerboard(8, 8);
+        grid[4] = [0, 0, 1, 0, 0, grid[4][5], grid[4][6], grid[4][7]];
+        grid[5][2] = 0;
+        grid[3][2] = 0;
+        grid[2][2] = 0;
+        return grid;
+    })(),
+};
+
+/**
  * Two specials already sitting next to each other — swap (3,3) <-> (3,4)
  * immediately to trigger their combo (striped-h + wrapped here). Change the
  * `specials` pair to test a different combination; the underlying cell
@@ -53,6 +76,28 @@ const comboReady: DebugLayout = {
     specials: [
         ['3,3', 'striped-h'],
         ['3,4', 'wrapped'],
+    ],
+};
+
+/**
+ * Same idea as `comboReady`, but swap (3,3) <-> (4,3) — a *vertical* swap —
+ * instead of a horizontal one. `comboReady` only exercises a horizontal
+ * combo swap, which can't distinguish `BoardView._attemptSwap`'s
+ * `forcesActivation` branch correctly tracking which node ends up at which
+ * grid position after the swap (needed so per-cell burst/pop effects land on
+ * the right sprite) from a version that doesn't — a vertical swap is a
+ * distinct code path worth checking too.
+ */
+const comboReadyVertical: DebugLayout = {
+    cells: (() => {
+        const grid = checkerboard(8, 8);
+        grid[3][3] = 4;
+        grid[4][3] = 5;
+        return grid;
+    })(),
+    specials: [
+        ['3,3', 'striped-h'],
+        ['4,3', 'wrapped'],
     ],
 };
 
@@ -129,12 +174,22 @@ const stripedV4Match: DebugLayout = {
  * A pre-existing striped-h tile at (4,1) sits inside a would-be 4-match —
  * swap (3,2) <-> (4,2) (a vertical swap, neither cell itself a special) to
  * complete a plain color match of type 0 at row 4, cols 0-3, which includes
- * the pre-existing special's own cell. Expected: the whole match clears
- * AND `resolve()`'s `_floodDetonate` bystander logic catches the special in
- * the blast, activating it from where it's sitting — since it's striped-h,
- * the activation should extend the clear across the *entire* row (cols 4-7,
- * checkerboard filler, get swept too), not just the 4 originally-matched
- * cells. If cols 4-7 do *not* clear, the bystander catch didn't fire.
+ * the pre-existing special's own cell AND spawns a new striped-v at the swap
+ * destination (4,2). This now plays out as **two** separate `resolve()`
+ * passes (see `Board.ts`'s `_catchBystanders`/`_expandCaught`), not one
+ * combined clear:
+ *
+ * - Pass 1: the 4-match's plain cells clear, AND the pre-existing striped-h
+ *   at (4,1) — directly part of this same matched run — activates
+ *   immediately, sweeping the *entire* row (cols 4-7, checkerboard filler,
+ *   get swept too). The new striped-v at (4,2) sits inside that swept row
+ *   but is left untouched this pass (deferred, not yet destroyed) rather
+ *   than being silently consumed in the same instant it was created.
+ * - Pass 2: the deferred striped-v at (4,2) activates on its own, as a
+ *   distinct beat, sweeping column 2.
+ *
+ * If cols 4-7 don't clear in pass 1, the bystander catch didn't fire. If
+ * column 2 doesn't clear in pass 2, the deferred chain reaction didn't fire.
  */
 const stripedBystanderCatch: DebugLayout = {
     cells: (() => {
@@ -219,7 +274,9 @@ const colorBombVsWrapped: DebugLayout = {
 
 export const debugLayouts: Record<string, DebugLayout> = {
     colorbomb: colorBombReady,
+    'colorbomb-beats-wrapped': colorBombBeatsWrapped,
     combo: comboReady,
+    'combo-vertical': comboReadyVertical,
     'colorbomb-activate': colorBombActivateReady,
     'colorbomb-colorbomb': colorBombVsColorBomb,
     'colorbomb-striped': colorBombVsStriped,

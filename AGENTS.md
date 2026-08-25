@@ -180,7 +180,7 @@ skipped:
   is confirmed correct via the direct `Board`-model tests described in "Real
   Candy Crush reference" (`_areaFor('wrapped', ...)`, exercised by the
   wrapped+wrapped and striped+wrapped combo tests). **Not yet seen live**:
-  a wrapped tile detonating via `_floodDetonate`'s passive chain-reaction
+  a wrapped tile detonating via `_catchBystanders`'s passive chain-reaction
   path specifically (i.e. an *ordinary* new match happening to clear a cell
   that already held a wrapped tile from an earlier turn) — the deliberate
   swap-activation path is what's been exercised so far, live and in tests.
@@ -335,7 +335,7 @@ what's on each side of a deliberate swap:
   all three for free by routing this case through the exact same
   `swap()`/`hasAnyMatch()`/`resolve()` path as two plain candies — a match
   that happens to include the special's cell picks it up via
-  `resolve()`'s `_floodDetonate` bystander logic, no special-casing needed.
+  `resolve()`'s `_catchBystanders` bystander logic, no special-casing needed.
   (Previously *every* special swap — lone or combo — always activated
   unconditionally; that matched Color Bomb's real rule but not
   striped/wrapped's.)
@@ -348,7 +348,9 @@ game's, not claimed to be pixel-exact except where noted):
   (`r1,c1`) — 15 cells on an 8-wide/tall board, verified directly against
   `Board`.
 - Striped + Wrapped → the same row+column, but `wrappedRadius`-cells thick
-  in each direction instead of a single line — verified directly.
+  in each direction instead of a single line, and (since this combo involves
+  a wrapped tile) **also double-explodes** the same way Wrapped+Wrapped does
+  below — verified directly.
 - Wrapped + Wrapped → a bigger area, `wrappedRadius * 2` instead of
   `wrappedRadius` (25 cells at the default radius), that **explodes twice**
   — matches candy_crush_rules.md's "5x5 blast area that explodes twice"
@@ -376,16 +378,30 @@ game's, not claimed to be pixel-exact except where noted):
   Wrapped+Wrapped and Wrapped+Color-Bomb combos above, but a lone wrapped
   tile too, whether caught passively in another special's blast, or
   activated via the swap-activation rule above (its own-color match at its
-  new cell). `Board._floodDetonate` queues the second explosion at the same
-  origin cell whenever it detonates a `'wrapped'` bystander; `Board.resolve()`
-  drains that queue (`Board._drainPending()`) at the start of its very next
-  call, against whatever fell into that spot by then. This is the
-  `PendingAction` mechanism referenced throughout this section — see its own
-  doc comment in `Board.ts` for the full contract.
+  new cell). `_expandCaught`/`_drainPending` queue the second explosion at
+  the same origin cell whenever a `'wrapped'` bystander detonates;
+  `Board.resolve()` drains that queue (`Board._drainPending()`) at the start
+  of its very next call, against whatever fell into that spot by then. This
+  is the `PendingAction` mechanism referenced throughout this section — see
+  its own doc comment in `Board.ts` for the full contract.
 - A special caught *passively* in another special's blast (not deliberately
   swapped) always just clears as a bystander — a Color Bomb never
-  chain-reacts this way (`_floodDetonate` explicitly skips it), since it has
-  no fixed "area of its own" the way striped/wrapped do.
+  chain-reacts this way (`_catchBystanders` explicitly skips it), since it
+  has no fixed "area of its own" the way striped/wrapped do.
+- **Chain reactions resolve as a sequence of phases, not one flattened
+  instant** — a bystander directly part of the *originally* matched/forced
+  cells activates immediately (its own area clears the same phase, one
+  visual beat, same as before), but anything that activation's own area
+  newly *reveals* (a different special sitting somewhere within its sweep,
+  not part of the original cells) is left untouched and deferred to the
+  *next* `resolve()` call instead of being expanded in the same instant —
+  `Board._catchBystanders`/`_expandCaught`, replacing the old
+  `_floodDetonate` recursive flood-fill. `BoardView._runCascade`'s existing
+  per-`resolve()`-call loop already animates each phase as its own beat with
+  no changes needed there. This is also why a freshly-created special (from
+  `resolve()`'s `registerSpawn`) is destroyed, never protected, if caught
+  this way — matching real Candy Crush — but the *chain reaction it in turn
+  causes* is its own later beat, not simultaneous with its own destruction.
 - **Not implemented**: the two swapped cells' *own* special entries are
   deleted from `Board.specials` before flooding, specifically so they don't
   *also* independently re-contribute their own base area as if they were an

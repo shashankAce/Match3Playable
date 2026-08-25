@@ -339,9 +339,17 @@ export class BoardView {
             // valid, never reverts. activateSpecialSwap reads the original
             // cells directly, so the board's own swap() never needs to run
             // for this path; both original cells always end up cleared
-            // regardless.
+            // regardless. `this.nodes[r,c]` must still track "whichever node
+            // is currently at grid position (r,c) on screen" though — same
+            // reassignment the normal-match path below does after its own
+            // swap tween, needed here for the same reason: `_runCascade`'s
+            // cleared-cell loop looks nodes up by grid label, and every
+            // burst/pop effect needs to land on the sprite actually sitting
+            // there, not the one that used to be there before this swap.
             n1.zIndex = DEFAULT_Z_INDEX;
             n2.zIndex = DEFAULT_Z_INDEX;
+            this.nodes[r1][c1] = n2;
+            this.nodes[r2][c2] = n1;
             const firstResult = this.board.activateSpecialSwap(r1, c1, s1, r2, c2, s2);
             await this._runCascade(undefined, firstResult);
             this.movesLeft--;
@@ -428,13 +436,20 @@ export class BoardView {
                 // Fire-and-forget visual flourish — never awaited, so it never
                 // affects cascade pacing. A cleared cell that was a detonating
                 // special gets that special's own burst shape; everything else
-                // gets the plain small burst.
+                // gets the plain small burst. A `'color-bomb'`-kind cell is
+                // the *other* candy's own original cell in a Color-Bomb-vs-
+                // plain-candy swap (its grid label doubles as `bombPos`, the
+                // beam's origin — see `Board.activateSpecialSwap`'s doc) —
+                // that candy still needs its own plain burst in its own
+                // color, layered on top of the beam/ring already playing at
+                // that same spot, or it silently clears with no flourish at
+                // all while every other same-color candy elsewhere gets one.
                 const activated = activatedByKey.get(key);
                 if (activated?.kind === 'striped-h' || activated?.kind === 'striped-v') {
                     this._spawnStripedBeam(activated.r, activated.c, activated.typeId, activated.kind === 'striped-h' ? 'h' : 'v');
                 } else if (activated?.kind === 'wrapped') {
                     this._spawnWrappedBurst(activated.r, activated.c, activated.typeId);
-                } else if (!activated) {
+                } else if (!activated || activated.kind === 'color-bomb') {
                     this._spawnPlainBurst(cell.r, cell.c, cell.typeId);
                 }
 
