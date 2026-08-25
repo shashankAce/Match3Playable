@@ -49,3 +49,7 @@ npm run pack:facebook   # or pack:telegram / pack:youtube / pack:google-playable
 ```
 
 There is no unit test runner — verify changes by running `npm run dev` and viewing the game in the browser.
+
+## Git
+
+Commit messages must **not** include a `Co-Authored-By` trailer.
