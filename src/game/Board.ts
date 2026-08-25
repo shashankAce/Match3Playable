@@ -14,6 +14,38 @@
  * and refill — and never *which* rule wins or what area a special clears.
  * Every such decision is a lookup in `rules.ts`. Adding a special kind, or
  * retuning which shape beats which, should mean editing `rules.ts` only.
+ *
+ * ## The order of operations
+ *
+ * Timing is a rule too, and Candy Crush's is specific: **a blast chain
+ * resolves completely on a still board, and only then does anything fall.**
+ * Detonate a striped candy into a wrapped candy and the wrapped goes off a
+ * beat later with nothing yet having moved. Gravity is the boundary between
+ * "this explosion finished resolving" and "the board settles and we look for
+ * new matches", which makes the loop nested rather than flat:
+ *
+ * ```
+ * MOVE
+ * ├─ combo pair? → activateSpecialSwap() seeds the blast
+ * │  else        → hasAnyMatch(); no match = revert, move over
+ * └─ CASCADE LOOP
+ *    ├─ BLAST LOOP                       ← no gravity anywhere inside
+ *    │    resolve()  beat 0: matched runs clear, specials spawn
+ *    │    resolve()  beat 1: specials caught by beat 0 detonate
+ *    │    resolve()  beat 2: specials caught by beat 1 detonate
+ *    │    …while hasQueuedBlast(), i.e. until a beat catches nothing new
+ *    ├─ settle()                         ← gravity + refill, once
+ *    └─ resolve()   post-gravity: `_spent` repeats + `_settledQueue`
+ *                   + any new match the fall created → loop, else move ends
+ * ```
+ *
+ * `resolve()` therefore does **not** run gravity — `settle()` does, and the
+ * caller (`BoardView._runCascade`) drives the two in that order. Getting this
+ * wrong is not a cosmetic bug: a chain reaction deliberately defers a caught
+ * special to the next beat by board position (`PendingAction`'s `'activate'`),
+ * so letting gravity run in between invalidates every one of those positions
+ * and the deferred detonation silently vanishes — which is exactly what used
+ * to happen when a Color Bomb was caught in a striped candy's blast.
  */
 
 import { theme } from '../config/theme';
@@ -21,8 +53,10 @@ import { rules, AreaSpec, SpecialKind, SpawnRule, FindComboRule } from '../confi
 
 export type { SpecialKind };
 
-/** Sentinel `cells[r][c]` value for a `colorless` special (the Color Bomb) — must never equal a real 0..typeCount-1 id or the -1 "empty" marker, or it could accidentally join/avoid a normal color run. */
+/** Sentinel `cells[r][c]` value for a `colorless` special (the Color Bomb) — must never equal a real 0..typeCount-1 id or `EMPTY_TYPE_ID`, or it could accidentally join/avoid a normal color run. */
 const COLORLESS_TYPE_ID = -2;
+/** Sentinel `cells[r][c]` value for a cleared cell awaiting the next `settle()`. Holes are visible to every scan between a `resolve()` and the fall that fills them, so nothing may treat this as a color. */
+const EMPTY_TYPE_ID = -1;
 
 export interface CellPos {
     r: number;
@@ -56,29 +90,63 @@ interface ActivatedSpecial {
 }
 
 /**
- * A detonation queued to fire on the *next* `resolve()` call, after this
- * pass's gravity/refill has settled — this is what turns a chain reaction
- * into a sequence of visible beats instead of one flattened blast, and what
- * implements `rules.activation[].repeats` (candy_crush_rules.md's "explodes...
- * drops down as board pieces fill in, and explodes a second time") and a
- * combo's `colorSweepAfter` ("after the explosions settle, it selects a
- * second random color...").
+ * A detonation queued to fire on a later `resolve()` call rather than in the
+ * phase that discovered it — what turns a chain reaction into a sequence of
+ * visible beats instead of one flattened blast.
  *
- * All three are *positional*: they name a board cell, not a tile. Whatever
- * has fallen into that cell by the time they fire is what they act on.
+ * Which queue an action goes into is the whole timing model, and the two are
+ * *not* interchangeable (see `Board`'s class doc for the full sequence):
+ *
+ * - `_blastQueue` — fires on the very next `resolve()`, with the board still
+ *   **frozen**: no gravity, no refill, nothing has moved. This is where a
+ *   `'activate'` goes, and it's why its `(r, c)` is trustworthy — the tile it
+ *   names cannot have gone anywhere in between. Candy Crush resolves a whole
+ *   blast chain on a still board, then drops everything at once.
+ * - `_settledQueue` — fires on the first `resolve()` *after* `settle()`, i.e.
+ *   after the fall. Only genuinely post-gravity effects belong here: a
+ *   combo's `repeat` and its `colorSweepAfter`.
+ *
+ * A `'burst'` is deliberately *positional* — it re-detonates a fixed area at
+ * a fixed board cell, whatever has since fallen into it, which is what a
+ * Wrapped + Wrapped combo's second 5x5 at the blast site actually does.
+ * Tile-bound repeats (`rules.activation[].repeats`) are emphatically *not*
+ * modelled this way: they ride with the tile through gravity as `_spent`
+ * entries instead, so a Wrapped Candy's second explosion follows the candy
+ * down instead of firing at the square it used to occupy.
  */
 type PendingAction =
     /** A fixed area re-detonating at a fixed board position, reported as the special `reportAs`. */
     | { kind: 'burst'; r: number; c: number; area: AreaSpec; reportAs: SpecialKind }
     /**
      * A specific bystander special discovered mid-chain this phase, but deliberately left
-     * uncleared (see `_expandCaught`'s doc) so it's still there next `resolve()` call:
-     * activates whatever special (if any) `this.specials` reports at `(r,c)` when this drains, a
-     * no-op if it fell away or was cleared by something else before then.
+     * uncleared (see `_expandCaught`'s doc) so it's still there next `resolve()` call.
+     * Queued on `_blastQueue`, so it drains against a board that has not moved and its
+     * `(r,c)` still names the same tile; a no-op if something else cleared it first.
      */
     | { kind: 'activate'; r: number; c: number }
     /** Pick a random color other than `excludeTypeId`, then detonate every tile of it as the special `as`. */
     | { kind: 'colorSweep'; excludeTypeId: number; as: SpecialKind };
+
+/**
+ * A special that has already fired once and is *still on the board*, owing
+ * more detonations — Candy Crush's Wrapped Candy, which "explodes, drops down
+ * as board pieces fill in, and explodes a second time".
+ *
+ * Held as board state keyed by cell rather than as a queued action, and
+ * carried through gravity by `_collapseAndRefill` alongside `specials`, which
+ * is precisely what makes the second explosion follow the *candy*: it lands
+ * wherever the candy lands. It also marks the tile as already-spent, so a
+ * later blast catching it doesn't set it off again — two adjacent Wrapped
+ * Candies would otherwise keep re-triggering each other forever, each
+ * surviving its own blast only to be re-caught by the other's.
+ */
+interface SpentSpecial {
+    kind: SpecialKind;
+    /** Detonations still owed. Reaching `0` is what finally clears the tile. */
+    remaining: number;
+    /** The color it detonates as — its own, captured before any of this. */
+    typeId: number;
+}
 
 export interface ResolveResult {
     /**
@@ -104,11 +172,10 @@ export interface ResolveResult {
     }[];
     /**
      * Newly created special tiles this pass, placed at their spawn cell (not
-     * cleared). `typeId` is captured at spawn time, not meant to be re-read
-     * from `cells[r][c]` afterward — gravity (this same `resolve()` call)
-     * can move the spawned tile to a different row, and whatever falls into
-     * its old (r,c) afterward would silently masquerade as the special's own
-     * color otherwise.
+     * cleared). `typeId` is captured at spawn time and is not meant to be
+     * re-read from `cells[r][c]` afterward — the next `settle()` can move the
+     * spawned tile to a different row, and whatever falls into its old (r,c)
+     * would then silently masquerade as the special's own color.
      */
     spawned: { r: number; c: number; special: SpecialKind; typeId: number }[];
     /**
@@ -167,10 +234,8 @@ export interface ResolveResult {
          */
         stages: { area: AreaSpec; wave: number }[];
     } | null;
-    /** Score awarded for this pass alone (before any further cascade passes), including `rules.scoring`'s cascade multiplier and special-creation bonuses. */
+    /** Score awarded for this beat alone, including `rules.scoring`'s cascade multiplier and special-creation bonuses. */
     scoreDelta: number;
-    /** Gravity/refill result, one entry per moved-or-spawned cell, empty if `cleared` was empty. */
-    moves: ColumnMove[];
 }
 
 /**
@@ -199,9 +264,69 @@ export class Board {
     cells: number[][] = [];
     /** "r,c" -> special kind, for cells currently holding a special tile. */
     specials: Map<string, SpecialKind> = new Map();
-    /** Queued detonations to apply at the start of the next `resolve()` call — see `PendingAction`. */
-    private _pending: PendingAction[] = [];
-    /** How many clearing passes have already run since `beginMove()` — indexes `rules.scoring.cascadeMultipliers`. */
+    /**
+     * Detonations owed on the next `resolve()`, with the board still frozen —
+     * the next beat of the current blast chain. See `PendingAction`.
+     */
+    private _blastQueue: PendingAction[] = [];
+    /**
+     * Detonations owed on the first `resolve()` *after* `settle()` — effects
+     * that are meant to happen once the board has fallen. `settle()` moves
+     * these onto `_blastQueue`. See `PendingAction`.
+     */
+    private _settledQueue: PendingAction[] = [];
+    /**
+     * "r,c" -> a special that has fired once and is still standing, owing
+     * more blasts. Board state, not a queue: `_collapseAndRefill` carries
+     * these down with the tile, so the second explosion lands wherever the
+     * candy lands. See `SpentSpecial`.
+     */
+    private _spent: Map<string, SpentSpecial> = new Map();
+    /**
+     * `true` once `settle()` has run and the tiles in `_spent` are due to fire
+     * again — cleared by the `resolve()` that fires them. Without this gate a
+     * Wrapped Candy's second blast would follow its first on the very next
+     * beat, with no fall in between, which is the one thing the real game's
+     * "explodes, drops down as board pieces fill in, and explodes a second
+     * time" explicitly is not.
+     */
+    private _repeatsDue = false;
+    /**
+     * Cells that detonated during the beat currently being resolved but are
+     * *not* to be cleared by it — a special that survives its own blast
+     * because it still owes repeats (see `_spendDetonation`). `_finalizeClear`
+     * subtracts these from `toClear` as the last act of the beat, so a
+     * survivor is protected from everything in its own beat, its own area
+     * included; only a later beat's blast can take it.
+     *
+     * Phase-scoped, like the beat's `toClear`: reset at the top of every
+     * `resolve()`/`activateSpecialSwap()` and consumed by the
+     * `_finalizeClear` that ends it. It lives here rather than being threaded
+     * through every `_expandCaught`/`_detonateAt` call for the same reason
+     * `_blastQueue` does — every one of those methods already writes to
+     * phase state on `this`.
+     */
+    private _survivors: Set<string> = new Set();
+    /**
+     * Every cell that has already detonated during the beat being resolved,
+     * whatever found it — a queued repeat coming due, a deferred catch, a
+     * bystander swept up by someone else's blast. One cell, one detonation
+     * per beat.
+     *
+     * Not redundant with the local `seen` sets: those are scoped to a single
+     * `_drainPending`/`_catchBystanders` call, and a beat runs both. A Wrapped
+     * Candy firing its final blast in `_drainPending` clears its `_spent`
+     * entry as it goes, so `_catchBystanders` — which reads the same cell out
+     * of `toClear` moments later and still finds a registered special there —
+     * would happily set it off a second time, and each of those would leave a
+     * fresh repeat owed: the candy never died and marched down its column
+     * exploding on every fall, forever.
+     *
+     * Phase-scoped like `_survivors`, reset by the `resolve()` that opens the
+     * beat.
+     */
+    private _fired: Set<string> = new Set();
+    /** How many falls have settled since `beginMove()` — indexes `rules.scoring.cascadeMultipliers`. */
     private _cascadeStep = 0;
     /** `rules.spawn`, highest priority first — sorted once, since the rule table never changes at runtime. */
     private readonly _spawnRules: SpawnRule[] = [...rules.spawn].sort((a, b) => b.priority - a.priority);
@@ -266,6 +391,23 @@ export class Board {
         return false;
     }
 
+    /**
+     * True if whatever special sits at `key` has already had its turn: it went
+     * off earlier in this same beat (`_fired`), or it went off in an earlier
+     * beat and is merely waiting out a repeat (`_spent`). Either way it is not
+     * a fresh domino, and every catch path has to agree on that — otherwise a
+     * Wrapped Candy is re-triggered by the very blast it just fired, or by a
+     * neighbour it just woke, and never finishes dying.
+     */
+    private _hasHadItsTurn(key: string): boolean {
+        return this._fired.has(key) || this._spent.has(key);
+    }
+
+    /** True only for a real tile-type id — not a Color Bomb's colorless sentinel, and not a cleared cell waiting on the next `settle()`. */
+    private _isColor(typeId: number): boolean {
+        return typeId >= 0 && typeId < this.typeCount;
+    }
+
     inBounds(r: number, c: number): boolean {
         return r >= 0 && r < this.rows && c >= 0 && c < this.cols;
     }
@@ -316,6 +458,14 @@ export class Board {
      */
     beginMove(): void {
         this._cascadeStep = 0;
+        // A completed cascade always drains itself dry, so these should
+        // already be empty — reset them anyway rather than let one stray beat
+        // from a previous move fire against a board the player has since
+        // changed.
+        this._blastQueue = [];
+        this._settledQueue = [];
+        this._spent.clear();
+        this._repeatsDue = false;
     }
 
     private _findRuns(): Run[] {
@@ -325,6 +475,19 @@ export class Board {
             let c = 0;
             while (c < this.cols) {
                 const t = this.cells[r][c];
+                // Only real colors can run. A Color Bomb's cell holds
+                // COLORLESS_TYPE_ID and a cleared cell holds EMPTY_TYPE_ID,
+                // and neither is a color — two or more sitting adjacent must
+                // not be read as a run of matching "color", or the spawn it
+                // triggers would carry the sentinel as its typeId.
+                //
+                // The empty case is live during a blast chain, not just a
+                // theoretical guard: `resolve()` blanks cells and leaves them
+                // blank until `settle()` runs, so mid-chain beats scan a board
+                // full of holes. Without this, three cells cleared in a row
+                // read as a three-match of nothing, and an L of them spawned a
+                // Wrapped Candy whose color was the sentinel.
+                if (!this._isColor(t)) { c++; continue; }
                 let end = c;
                 while (end + 1 < this.cols && this.cells[r][end + 1] === t) end++;
                 if (end - c + 1 >= rules.matching.minMatchLength) {
@@ -340,6 +503,7 @@ export class Board {
             let r = 0;
             while (r < this.rows) {
                 const t = this.cells[r][c];
+                if (!this._isColor(t)) { r++; continue; }
                 let end = r;
                 while (end + 1 < this.rows && this.cells[end + 1][c] === t) end++;
                 if (end - r + 1 >= rules.matching.minMatchLength) {
@@ -390,10 +554,15 @@ export class Board {
     }
 
     /**
-     * Resolves every currently-matched run into clears + special spawns +
-     * gravity/refill, expanding into any specials caught in the blast
-     * (chained detonation). Call repeatedly (cascade) until it returns an
-     * empty `cleared` list.
+     * Resolves **one beat** of the board: every currently-matched run into
+     * clears + special spawns, plus whatever the previous beat queued, plus
+     * any special caught in the blast. Deliberately does *not* run gravity —
+     * that's `settle()`, and see this file's "The order of operations" for why
+     * the two are separate calls and which order to drive them in.
+     *
+     * The caller loops: `resolve()` while `hasQueuedBlast()` (the chain
+     * reaction, board frozen), then `settle()`, then `resolve()` again for the
+     * post-fall beat, until a `resolve()` clears nothing.
      *
      * Which special a given match makes — and which of two crossing matches
      * wins when they can't both spawn — comes entirely from `rules.spawn`'s
@@ -406,14 +575,17 @@ export class Board {
      * have no swap to prefer.
      */
     resolve(preferredCells?: CellPos[]): ResolveResult {
-        // Any second explosion queued by a previous pass's detonation (or a
-        // combo's second-color wave) fires now, against the board as it
-        // stands after that pass's own refill.
-        const { toClear: forcedClear, activated: forcedActivated } = this._drainPending();
+        this._survivors.clear();
+        this._fired.clear();
+        // Whatever the previous beat deferred (a caught special left standing
+        // so it reads as its own beat), plus — only on the first beat after a
+        // `settle()` — every tile that owes a repeat and the post-fall actions
+        // `settle()` handed over.
+        const { toClear: forcedClear, activated: forcedActivated, colorBombBeam: forcedBeam } = this._drainPending();
 
         const runs = this._findRuns();
-        if (runs.length === 0 && forcedClear.size === 0) {
-            return { cleared: [], spawned: [], activatedSpecials: [], colorBombBeam: null, comboBlast: null, consumed: [], scoreDelta: 0, moves: [] };
+        if (runs.length === 0 && forcedClear.size === 0 && this._survivors.size === 0) {
+            return { cleared: [], spawned: [], activatedSpecials: [], colorBombBeam: null, comboBlast: null, consumed: [], scoreDelta: 0 };
         }
 
         const toClear = forcedClear;
@@ -497,9 +669,55 @@ export class Board {
         // sticks regardless of processing order.
         for (const s of spawned) toClear.delete(Board.key(s.r, s.c));
 
-        const activatedSpecials = [...forcedActivated, ...this._catchBystanders(toClear)];
+        const { activated: bystanderActivated, colorBombBeam: bystanderBeam } = this._catchBystanders(toClear);
+        const activatedSpecials = [...forcedActivated, ...bystanderActivated];
 
-        return this._finalizeClear(toClear, activatedSpecials, null, spawned);
+        return this._finalizeClear(toClear, activatedSpecials, forcedBeam ?? bystanderBeam, spawned);
+    }
+
+    /**
+     * `true` while the current blast chain still owes a beat — a special that
+     * another special's blast caught and that was deliberately left standing
+     * so it reads as its own explosion.
+     *
+     * The cascade driver must keep calling `resolve()` while this is true and
+     * only `settle()` once it goes false. That ordering is the rule, not an
+     * optimisation: every queued beat names a board cell, and those cells mean
+     * what they say precisely because nothing has fallen yet.
+     */
+    hasQueuedBlast(): boolean {
+        return this._blastQueue.length > 0;
+    }
+
+    /**
+     * Ends the blast phase: gravity + refill in one go, exactly as the real
+     * game does it — the whole chain reaction has finished on a still board,
+     * and now everything drops at once.
+     *
+     * Also the moment the post-fall work comes due: `_settledQueue` (a combo's
+     * second blast at the site, its second-colour sweep) moves onto
+     * `_blastQueue`, and every tile still owing a repeat is marked due, so the
+     * very next `resolve()` fires them from wherever they landed. The cascade
+     * multiplier advances here too — one step per *fall*, which is what a
+     * cascade level actually is, rather than one per beat of a single chain.
+     *
+     * @returns One entry per tile that actually moved or spawned; empty if the
+     * board had no holes to fill, which is how the driver knows there's no
+     * fall to animate.
+     */
+    settle(): ColumnMove[] {
+        const moves = this._collapseAndRefill();
+        if (moves.length > 0) this._cascadeStep++;
+        // Positional by design and deliberately *not* remapped through the
+        // fall: `'burst'` names a board square that explodes again (a Wrapped +
+        // Wrapped combo's second 5x5 at the blast site), and `'colorSweep'`
+        // names a colour, not a place. Anything that has to follow a *tile*
+        // through gravity lives in `_spent`, which `_collapseAndRefill`
+        // re-keys, never here.
+        this._blastQueue.push(...this._settledQueue);
+        this._settledQueue = [];
+        this._repeatsDue = this._spent.size > 0;
+        return moves;
     }
 
     /**
@@ -570,12 +788,13 @@ export class Board {
     }
 
     /**
-     * Shared tail for both `resolve()` and `activateSpecialSwap()`: scores,
-     * clears cells, drops any spawned special whose cell ended up in
-     * `toClear` after all (see `registerSpawn`'s doc — a freshly-spawned
-     * special caught within this same phase's own snapshot is destroyed, not
-     * protected, matching real Candy Crush), runs gravity/refill, and builds
-     * the `ResolveResult`.
+     * Shared tail for both `resolve()` and `activateSpecialSwap()`: releases
+     * the beat's survivors, scores, clears cells, drops any spawned special
+     * whose cell ended up in `toClear` after all (see `registerSpawn`'s doc —
+     * a freshly-spawned special caught within this same phase's own snapshot
+     * is destroyed, not protected, matching real Candy Crush), and builds the
+     * `ResolveResult`. Runs **no gravity**; that's `settle()`'s job, called by
+     * the cascade driver once the whole blast chain is dry.
      */
     private _finalizeClear(
         toClear: Set<string>,
@@ -586,56 +805,131 @@ export class Board {
         waves: Map<string, number> = new Map(),
         consumed: CellPos[] = []
     ): ResolveResult {
+        // A special that fired but still owes repeats stays standing, even if
+        // its own area (or another blast this same beat) put it in `toClear`.
+        // Applied here, after every contributor to the beat has had its say,
+        // for the same reason `spawned`'s protection is re-asserted late:
+        // whichever effect claims the cell last must not be the one that
+        // decides its fate.
+        for (const k of this._survivors) toClear.delete(k);
+
         const cleared: ResolveResult['cleared'] = [];
         for (const k of toClear) {
             const [r, c] = Board.parseKey(k);
+            // Already a hole from an earlier beat of this same chain — the
+            // board hasn't fallen yet, so blasts routinely overlap ground that
+            // is already gone. Reporting it again would pop a tile that isn't
+            // there, score it twice and decrement a collect target twice.
+            if (this.cells[r][c] === EMPTY_TYPE_ID) continue;
             cleared.push({ r, c, typeId: this.cells[r][c], wave: waves.get(k) ?? 0 });
-            this.cells[r][c] = -1;
+            this.cells[r][c] = EMPTY_TYPE_ID;
             this.specials.delete(k);
+            // A spent special caught by someone else's blast before it could
+            // fire again goes with everything else, and the repeat it owed
+            // goes with it — never left behind as a phantom explosion.
+            this._spent.delete(k);
         }
         const survivingSpawned = spawned.filter(s => !toClear.has(Board.key(s.r, s.c)));
         const scoreDelta = this._score(toClear.size, survivingSpawned);
 
-        const moves = this._collapseAndRefill();
-
-        return { cleared, spawned: survivingSpawned, activatedSpecials, colorBombBeam, comboBlast, consumed, scoreDelta, moves };
+        return { cleared, spawned: survivingSpawned, activatedSpecials, colorBombBeam, comboBlast, consumed, scoreDelta };
     }
 
     /**
      * `rules.scoring`, applied: every cleared cell at `pointsPerTile`, scaled
      * by this move's cascade depth, plus a flat bonus per special created.
-     * Advances the cascade counter, so the next pass within the same move
-     * scores higher — `beginMove()` is what resets it.
+     * Reads the cascade counter without advancing it — `settle()` advances it
+     * once per *fall*, so a chain reaction's separate beats all score at the
+     * same multiplier (they're one cascade level, not several) and
+     * `beginMove()` resets it.
      */
     private _score(clearedCount: number, spawned: { special: SpecialKind }[]): number {
         if (clearedCount === 0) return 0;
         const multipliers = rules.scoring.cascadeMultipliers;
         const multiplier = multipliers[Math.min(this._cascadeStep, multipliers.length - 1)] ?? 1;
-        this._cascadeStep++;
         let score = Math.round(clearedCount * rules.scoring.pointsPerTile * multiplier);
         for (const s of spawned) score += rules.scoring.specialCreateBonus[s.special] ?? 0;
         return score;
     }
 
     /**
-     * Pops every queued `PendingAction` and resolves it against the board's
-     * *current* state (post-refill, since this only ever runs at the top of
-     * the next `resolve()` call) into a forced-clear set — see
-     * `PendingAction`'s own doc for why these exist. A `'colorSweep'` re-queues
-     * each swept cell's own `repeats`, so a combo's second wave follows the
-     * same detonation rules as any other. `'activate'` runs the caught
-     * special through `_expandCaught` the same as `_catchBystanders` does, via
-     * a `seen`/`deferred` pair scoped to this one drain call — not a simpler
-     * "just dump the whole area in" path — so anything *it* in turn catches
-     * defers to yet another phase instead of flattening back into this one.
+     * Accounts for one detonation of `kind` at (r,c) and answers the only
+     * question that matters to the caller: **which area does this blast
+     * clear**. It also decides the tile's own fate, which is the whole of
+     * Candy Crush's double-explosion rule:
+     *
+     * - Nothing owed (`repeats: 0` — stripes, Color Bombs): the tile is spent
+     *   the instant it fires and clears with its own area.
+     * - Repeats owed (`repeats: 1` — the Wrapped Candy): the tile **survives**
+     *   this blast. It's recorded in `_spent`, protected from this beat's
+     *   `toClear` via `_survivors`, and stays a registered special so it keeps
+     *   its art and rides gravity like any other tile. `settle()` then marks
+     *   it due and the next `resolve()` fires it again — "explodes, drops down
+     *   as board pieces fill in, and explodes a second time", with the second
+     *   explosion following the *candy* rather than the square it started in.
+     * - Firing a repeat: the owed count drops, and `repeatArea` (if the rule
+     *   gives one) is what goes off this time. Reaching zero clears the tile.
+     *
+     * Because a surviving tile is left in `_spent`, every catch path treats it
+     * as already-spent and will not set it off again — see `_expandCaught`.
      */
-    private _drainPending(): { toClear: Set<string>; activated: ActivatedSpecial[] } {
+    private _spendDetonation(kind: SpecialKind, r: number, c: number, typeId: number): AreaSpec {
+        const activation = rules.activation[kind];
+        const key = Board.key(r, c);
+        const spent = this._spent.get(key);
+        this._fired.add(key);
+        // Blasts still to come after this one: `repeats` on a first firing,
+        // one fewer each time a repeat is spent.
+        const remaining = spent ? spent.remaining - 1 : activation.repeats;
+        if (remaining > 0) {
+            this._spent.set(key, { kind, remaining, typeId });
+            this.specials.set(key, kind);
+            this._survivors.add(key);
+        } else {
+            this._spent.delete(key);
+        }
+        return spent ? (activation.repeatArea ?? activation.area) : activation.area;
+    }
+
+    /**
+     * Everything owed to *this* beat: the previous beat's deferred catches
+     * (`_blastQueue`), and — only on the first beat after a `settle()` — every
+     * tile in `_spent` firing again. Resolved into a forced-clear set against
+     * the board exactly as it stands now.
+     *
+     * A `'colorSweep'` re-detonates each swept cell as `as`, so a combo's
+     * second wave follows the same detonation (and repeat) rules as any other.
+     * `'activate'` runs the caught special through `_expandCaught` the same
+     * way `_catchBystanders` does, via a `seen`/`deferred` pair scoped to this
+     * one drain call — not a simpler "just dump the whole area in" path — so
+     * anything *it* in turn catches defers to yet another beat instead of
+     * flattening back into this one.
+     */
+    private _drainPending(): { toClear: Set<string>; activated: ActivatedSpecial[]; colorBombBeam: ResolveResult['colorBombBeam'] } {
         const toClear = new Set<string>();
         const seen = new Set<string>();
         const deferred = new Set<string>();
         const activated: ActivatedSpecial[] = [];
-        const pending = this._pending;
-        this._pending = [];
+        let colorBombBeam: ResolveResult['colorBombBeam'] = null;
+        const pending = this._blastQueue;
+        this._blastQueue = [];
+
+        // The board has fallen, so every tile still owing a blast fires from
+        // wherever it landed. Snapshotted first: `_spendDetonation` rewrites
+        // `_spent` as it goes.
+        if (this._repeatsDue) {
+            this._repeatsDue = false;
+            for (const [key, owed] of Array.from(this._spent)) {
+                const [r, c] = Board.parseKey(key);
+                const area = this._spendDetonation(owed.kind, r, c, owed.typeId);
+                toClear.add(key);
+                seen.add(key);
+                for (const cell of this._areaCells(area, r, c, owed.typeId)) {
+                    toClear.add(Board.key(cell.r, cell.c));
+                }
+                activated.push({ r, c, kind: owed.kind, typeId: owed.typeId, wave: 0 });
+            }
+        }
 
         for (const action of pending) {
             if (action.kind === 'burst') {
@@ -646,12 +940,18 @@ export class Board {
             } else if (action.kind === 'activate') {
                 const key = Board.key(action.r, action.c);
                 const kind = this.specials.get(key);
-                // Fell away, or is a kind that never chain-reacts — nothing to do.
-                if (!kind || !rules.activation[kind].chainsWhenCaught) continue;
+                // Cleared by something else in the meantime, a kind that never
+                // chain-reacts, or a tile that has already fired and is just
+                // waiting out its repeat — nothing to do.
+                if (!kind || !rules.activation[kind].chainsWhenCaught || this._hasHadItsTurn(key)) continue;
                 toClear.add(key);
                 seen.add(key);
                 activated.push({ r: action.r, c: action.c, kind, typeId: this.cells[action.r][action.c], wave: 0 });
-                this._expandCaught(kind, action.r, action.c, toClear, seen, deferred);
+                if (kind === 'color-bomb') {
+                    colorBombBeam = colorBombBeam ?? this._expandCaughtColorBomb(action.r, action.c, toClear, seen, deferred);
+                } else {
+                    this._expandCaught(kind, action.r, action.c, toClear, seen, deferred);
+                }
             } else {
                 const candidates: number[] = [];
                 for (let t = 0; t < this.typeCount; t++) {
@@ -665,16 +965,21 @@ export class Board {
             }
         }
 
-        return { toClear, activated };
+        return { toClear, activated, colorBombBeam };
     }
 
     /**
      * Fires `kind`'s own `rules.activation` effect at (r,c) as a flat,
-     * non-chaining detonation: its area joins `toClear` and its `repeats` are
-     * queued for the next phase. Used where a cell is being detonated *as if*
-     * it held a special it doesn't actually hold — a combo's
-     * `spreadPartnerActivation` and a `colorSweep`'s wave — so unlike
-     * `_expandCaught` there's no bystander/defer bookkeeping to do.
+     * non-chaining detonation: its area joins `toClear`, and `_spendDetonation`
+     * decides whether the cell itself survives to fire again. Used where a
+     * cell is being detonated *as if* it held a special it doesn't actually
+     * hold — a combo's `spreadPartnerActivation` and a `colorSweep`'s wave —
+     * so unlike `_expandCaught` there's no bystander/defer bookkeeping to do.
+     *
+     * A Color Bomb + Wrapped swap leans on the survival half of that: every
+     * candy of the colour becomes a Wrapped Candy and blasts, the survivors
+     * ride the fall, and they all blast a second time. That double wave *is*
+     * the combo (see `rules.ts`'s `bomb+wrapped` note), not a bonus colour.
      */
     private _detonateAt(
         kind: SpecialKind,
@@ -686,8 +991,8 @@ export class Board {
         wave = 0,
         waves?: Map<string, number>
     ): void {
-        const activation = rules.activation[kind];
-        for (const cell of this._areaCells(activation.area, r, c, typeId)) {
+        const area = this._spendDetonation(kind, r, c, typeId);
+        for (const cell of this._areaCells(area, r, c, typeId)) {
             const key = Board.key(cell.r, cell.c);
             toClear.add(key);
             // Lowest wins: a cell in two detonations' paths belongs to
@@ -695,7 +1000,6 @@ export class Board {
             if (waves && wave < (waves.get(key) ?? Infinity)) waves.set(key, wave);
         }
         activated.push({ r, c, kind, typeId, wave });
-        this._queueRepeats(kind, r, c);
     }
 
     /** Swaps a band's axis — see `ComboRule.orientToPartner`. Anything that isn't a band is returned untouched. */
@@ -724,14 +1028,6 @@ export class Board {
         return Math.random() < 0.5 ? 'striped-h' : 'striped-v';
     }
 
-    /** Queues a special's `repeats` re-detonations at (r,c) for the next phase — the always-double-explodes rule, as data. */
-    private _queueRepeats(kind: SpecialKind, r: number, c: number): void {
-        const activation = rules.activation[kind];
-        for (let i = 0; i < activation.repeats; i++) {
-            this._pending.push({ kind: 'burst', r, c, area: activation.repeatArea ?? activation.area, reportAs: kind });
-        }
-    }
-
     /**
      * Called instead of `resolve()` for a swap whose two sides match a
      * `rules.combos` rule — a Color Bomb on either side, or two non-bomb
@@ -757,6 +1053,8 @@ export class Board {
      * of its color detonated around it.
      */
     activateSpecialSwap(r1: number, c1: number, r2: number, c2: number): ResolveResult {
+        this._survivors.clear();
+        this._fired.clear();
         const k1 = this.getSpecialAt(r1, c1);
         const k2 = this.getSpecialAt(r2, c2);
         const toClear = new Set<string>([Board.key(r1, c1), Board.key(r2, c2)]);
@@ -863,10 +1161,10 @@ export class Board {
                 if (!rule.partnerConsumed) {
                     // Not consumed: the partner fires its own area from its own
                     // cell, keeping its own orientation, and owes its repeats.
-                    for (const cell of this._areaCells(rules.activation[b.kind].area, b.r, b.c, targetTypeId)) {
+                    const area = this._spendDetonation(b.kind, b.r, b.c, targetTypeId);
+                    for (const cell of this._areaCells(area, b.r, b.c, targetTypeId)) {
                         toClear.add(Board.key(cell.r, cell.c));
                     }
-                    this._queueRepeats(b.kind, b.r, b.c);
                 }
             }
 
@@ -885,11 +1183,15 @@ export class Board {
                         .map(cell => ({ r: cell.r, c: cell.c, wave: waves.get(Board.key(cell.r, cell.c)) ?? 0 })),
                 };
             }
+            // Both are post-fall by definition ("a second blast one phase
+            // later", "after this combo settles") and so go on `_settledQueue`,
+            // which `settle()` hands over once the board has dropped — not on
+            // `_blastQueue`, which fires within this same still-frozen chain.
             if (rule.repeat) {
-                this._pending.push({ kind: 'burst', r: a.r, c: a.c, area: rule.repeat.area, reportAs: rule.repeat.as });
+                this._settledQueue.push({ kind: 'burst', r: a.r, c: a.c, area: rule.repeat.area, reportAs: rule.repeat.as });
             }
             if (rule.colorSweepAfter) {
-                this._pending.push({ kind: 'colorSweep', excludeTypeId: targetTypeId, as: rule.colorSweepAfter.as });
+                this._settledQueue.push({ kind: 'colorSweep', excludeTypeId: targetTypeId, as: rule.colorSweepAfter.as });
             }
         }
 
@@ -905,82 +1207,106 @@ export class Board {
         // only a genuinely different special incidentally caught within that
         // blast (not one of this combo's own deliberate cells) defers to the
         // next phase.
-        activated.push(...this._catchBystanders(toClear));
+        const bystanders = this._catchBystanders(toClear);
+        activated.push(...bystanders.activated);
+        colorBombBeam = colorBombBeam ?? bystanders.colorBombBeam;
 
         return this._finalizeClear(toClear, activated, colorBombBeam, [], comboBlast, waves, consumed);
     }
 
     /**
-     * Merges one activating special's own declared area
-     * (`rules.activation[kind].area`) into `toClear` — the atomic, instant
-     * consequence of it going off, all in this one phase (matches how a
-     * striped candy's activation reads as one beat, not a slow reveal).
-     * `seen` is every cell already decided as active this same phase (the
+     * Merges one activating special's own declared area into `toClear` — the
+     * atomic, instant consequence of it going off, all in this one beat
+     * (matches how a striped candy's activation reads as one beat, not a slow
+     * reveal). Which area that is, and whether the special itself survives to
+     * fire again, is `_spendDetonation`'s call.
+     *
+     * `seen` is every cell already decided as active this same beat (the
      * caller's snapshot, plus this special's own key); a newly-touched cell
      * already in `toClear` or `seen` merges directly — it's already part of
-     * this phase for some other reason, not a new discovery.
+     * this beat for some other reason, not a new discovery.
      *
      * A newly-touched cell that isn't already decided but *does* hold a
-     * different special is the actual "next domino": rather than expanding
-     * it right here (which is what used to flatten an entire chain reaction
-     * into one instantaneous blob), it's left **completely untouched** —
-     * not added to `toClear`, not cleared, not moved by gravity this pass —
-     * and a `{kind:'activate', r, c}` is queued instead, so `_drainPending`'s
-     * lookup on the *next* `resolve()` call is guaranteed to still find it
-     * exactly where it is. `deferred` dedupes that queuing per call: if two
-     * different catches this phase both reach the same not-yet-decided cell,
-     * it's only queued once (otherwise a caught wrapped tile could end up
-     * double-reburst-queued from two directions).
+     * different, unspent special is the actual "next domino": rather than
+     * expanding it right here (which is what used to flatten an entire chain
+     * reaction into one instantaneous blob), it's left **completely
+     * untouched** — not added to `toClear`, not cleared — and a
+     * `{kind:'activate', r, c}` goes on `_blastQueue` instead.
      *
-     * The special's own `repeats` are queued unconditionally on top of all
-     * that (self, not defer-checked against another special) — the
-     * always-double-explodes rule, unaffected by any of the above.
+     * That queue is the one that fires on the very next `resolve()` with the
+     * board still frozen, which is what makes the `(r, c)` it carries sound:
+     * nothing falls in between, so the tile is guaranteed to still be exactly
+     * there. It was not always so — the deferral used to survive a
+     * gravity/refill pass, and any deferred special whose column had a hole
+     * under it silently fell out from under its own queued detonation and
+     * never went off at all. A Color Bomb caught in a striped candy's blast
+     * was the common way to see it: the stripe fired, the bomb dropped a row,
+     * and nothing happened.
+     *
+     * A cell whose special has already had its turn (`_hasHadItsTurn` — it
+     * fired earlier this beat, or is mid-double-explosion) is not a domino, so
+     * it clears like any plain tile, taking any repeat it still owed with it.
+     *
+     * `deferred` dedupes the queuing per call: if two different catches this
+     * beat both reach the same not-yet-decided cell, it's only queued once
+     * (otherwise a caught wrapped tile could end up double-queued from two
+     * directions).
      */
     private _expandCaught(kind: SpecialKind, r: number, c: number, toClear: Set<string>, seen: Set<string>, deferred: Set<string>): void {
-        this._queueRepeats(kind, r, c);
-        for (const cell of this._areaCells(rules.activation[kind].area, r, c, this.cells[r][c])) {
+        const area = this._spendDetonation(kind, r, c, this.cells[r][c]);
+        for (const cell of this._areaCells(area, r, c, this.cells[r][c])) {
             const ek = Board.key(cell.r, cell.c);
             if (toClear.has(ek) || seen.has(ek)) {
                 toClear.add(ek);
                 continue;
             }
             const otherKind = this.specials.get(ek);
-            if (!otherKind) {
+            if (!otherKind || this._hasHadItsTurn(ek)) {
                 toClear.add(ek);
             } else if (!deferred.has(ek)) {
                 deferred.add(ek);
-                this._pending.push({ kind: 'activate', r: cell.r, c: cell.c });
+                this._blastQueue.push({ kind: 'activate', r: cell.r, c: cell.c });
             }
             // else: a different special, already deferred by another catch
-            // this same phase — left untouched, already queued.
+            // this same beat — left untouched, already queued.
         }
     }
 
     /**
      * Single pass (not a recursive flood-fill) over a snapshot of `toClear`
      * as it stands right now: every cell already queued to clear that holds
-     * a special with `chainsWhenCaught` activates immediately via
-     * `_expandCaught`, contributing its own area to *this* phase. (A Color
-     * Bomb caught passively is just a bystander — `chainsWhenCaught: false`.)
-     * Anything *that* newly reveals gets deferred to the next `resolve()`
-     * call instead of being expanded further here — see `_expandCaught`'s doc
-     * for why. This is what turns a chain of catches into a sequence of
-     * separate visual beats (one per `resolve()` call) instead of one
-     * flattened blast.
+     * a special with `chainsWhenCaught` activates immediately, contributing
+     * its own area to *this* phase — a caught Color Bomb hunts the board's
+     * most common color via `_expandCaughtColorBomb` instead of `rules.ts`'s
+     * shape-based area, since it has no area of its own to look up. Anything
+     * that catch newly reveals gets deferred to the next `resolve()` beat
+     * instead of being expanded further here — see `_expandCaught`'s doc for
+     * why. This is what turns a chain of catches into a sequence of separate
+     * visual beats (one per `resolve()` call, all on a still board) instead of
+     * one flattened blast.
      */
-    private _catchBystanders(toClear: Set<string>): ActivatedSpecial[] {
+    private _catchBystanders(toClear: Set<string>): { activated: ActivatedSpecial[]; colorBombBeam: ResolveResult['colorBombBeam'] } {
         const activated: ActivatedSpecial[] = [];
         const seen = new Set<string>();
         const deferred = new Set<string>();
+        let colorBombBeam: ResolveResult['colorBombBeam'] = null;
         for (const k of Array.from(toClear)) {
             const kind = this.specials.get(k);
-            if (!kind || !rules.activation[kind].chainsWhenCaught || seen.has(k)) continue;
+            // `_hasHadItsTurn`: already fired, this beat or an earlier one, so
+            // it's not a fresh domino — without this check a Wrapped Candy is
+            // re-triggered by its own blast, and two adjacent ones re-trigger
+            // each other forever, neither ever finishing dying.
+            if (!kind || !rules.activation[kind].chainsWhenCaught || seen.has(k) || this._hasHadItsTurn(k)) continue;
             seen.add(k);
             const [r, c] = Board.parseKey(k);
             activated.push({ r, c, kind, typeId: this.cells[r][c], wave: 0 });
-            this._expandCaught(kind, r, c, toClear, seen, deferred);
+            if (kind === 'color-bomb') {
+                colorBombBeam = colorBombBeam ?? this._expandCaughtColorBomb(r, c, toClear, seen, deferred);
+            } else {
+                this._expandCaught(kind, r, c, toClear, seen, deferred);
+            }
         }
-        return activated;
+        return { activated, colorBombBeam };
     }
 
     /**
@@ -1072,9 +1398,15 @@ export class Board {
         }
     }
 
-    /** Every cell currently holding `typeId` — the Color Bomb's target list. A colorless special's sentinel id never matches a real one, so bombs are never swept up by another bomb's color. */
+    /**
+     * Every cell currently holding `typeId` — the Color Bomb's target list.
+     * Answers with nothing at all unless `typeId` is a real color, so a
+     * sentinel can never be swept as if it were one: bombs are not collected
+     * by another bomb's color, and mid-chain holes are not "matched".
+     */
     private _sameColorCells(typeId: number): CellPos[] {
         const cells: CellPos[] = [];
+        if (!this._isColor(typeId)) return cells;
         for (let r = 0; r < this.rows; r++) {
             for (let c = 0; c < this.cols; c++) {
                 if (this.cells[r][c] === typeId) cells.push({ r, c });
@@ -1083,29 +1415,112 @@ export class Board {
         return cells;
     }
 
+    /**
+     * The color with the most cells on the board right now, ties broken
+     * uniformly at random — what a passively-caught Color Bomb hunts, since
+     * (unlike a deliberate swap) it has no partner candy to take a color
+     * from. Falls back to a uniformly random color if none is present at
+     * all (an all-colorless board, in practice never reachable).
+     */
+    private _mostCommonTypeId(): number {
+        const counts = new Array<number>(this.typeCount).fill(0);
+        for (let r = 0; r < this.rows; r++) {
+            for (let c = 0; c < this.cols; c++) {
+                const t = this.cells[r][c];
+                if (t >= 0 && t < this.typeCount) counts[t]++;
+            }
+        }
+        const max = Math.max(...counts);
+        if (max === 0) return Math.floor(Math.random() * this.typeCount);
+        const top: number[] = [];
+        for (let t = 0; t < this.typeCount; t++) if (counts[t] === max) top.push(t);
+        return top[Math.floor(Math.random() * top.length)];
+    }
+
+    /**
+     * A passively-caught Color Bomb's own expansion: picks its target color
+     * via `_mostCommonTypeId` and clears every cell of that color, the same
+     * way `_expandCaught` clears an area — a not-yet-decided plain cell
+     * clears directly, a not-yet-decided special defers to the next phase.
+     * Deliberately does NOT convert same-color specials into anything (no
+     * `spreadPartnerActivation`-style upgrade) — a passive catch is a plain
+     * color clear, never a combo.
+     */
+    private _expandCaughtColorBomb(
+        r: number, c: number,
+        toClear: Set<string>, seen: Set<string>, deferred: Set<string>
+    ): NonNullable<ResolveResult['colorBombBeam']> {
+        this._spendDetonation('color-bomb', r, c, this.cells[r][c]);
+        const targetTypeId = this._mostCommonTypeId();
+        const cells: { r: number; c: number; wave: number }[] = [];
+        for (const cell of this._sameColorCells(targetTypeId)) {
+            if (cell.r === r && cell.c === c) continue;
+            const ek = Board.key(cell.r, cell.c);
+            cells.push({ r: cell.r, c: cell.c, wave: 0 });
+            if (toClear.has(ek) || seen.has(ek)) {
+                toClear.add(ek);
+                continue;
+            }
+            const otherKind = this.specials.get(ek);
+            if (!otherKind || this._hasHadItsTurn(ek)) {
+                toClear.add(ek);
+            } else if (!deferred.has(ek)) {
+                deferred.add(ek);
+                this._blastQueue.push({ kind: 'activate', r: cell.r, c: cell.c });
+            }
+        }
+        return { origins: [{ r, c }], targetTypeId, sweep: false, cells };
+    }
+
+    /**
+     * Gravity + refill, and the one place a tile's per-cell state travels with
+     * it: `specials` *and* `_spent` are both re-keyed to the tile's new row.
+     * Carrying `_spent` is what makes a Wrapped Candy's second explosion
+     * follow the candy down instead of firing at the square it launched from.
+     *
+     * Only tiles that actually change row (and freshly spawned ones) are
+     * reported as `ColumnMove`s — a full column of untouched tiles produces no
+     * moves at all, so the caller has nothing to animate and `settle()` can
+     * tell a real fall from a no-op.
+     */
     private _collapseAndRefill(): ColumnMove[] {
         const moves: ColumnMove[] = [];
 
         for (let c = 0; c < this.cols; c++) {
-            const survivors: { r: number; typeId: number; special: SpecialKind | null }[] = [];
+            const survivors: { r: number; typeId: number; special: SpecialKind | null; spent: SpentSpecial | null }[] = [];
             for (let r = 0; r < this.rows; r++) {
-                if (this.cells[r][c] !== -1) {
-                    survivors.push({ r, typeId: this.cells[r][c], special: this.specials.get(Board.key(r, c)) ?? null });
+                if (this.cells[r][c] !== EMPTY_TYPE_ID) {
+                    const key = Board.key(r, c);
+                    survivors.push({
+                        r,
+                        typeId: this.cells[r][c],
+                        special: this.specials.get(key) ?? null,
+                        spent: this._spent.get(key) ?? null,
+                    });
                 }
             }
 
             // Collected above from old positions — clear the whole column's
-            // special entries now so a surviving tile's old key doesn't linger
+            // per-cell entries now so a surviving tile's old key doesn't linger
             // as a stale duplicate once it's re-added at its new row below.
-            for (let r = 0; r < this.rows; r++) this.specials.delete(Board.key(r, c));
+            for (let r = 0; r < this.rows; r++) {
+                const key = Board.key(r, c);
+                this.specials.delete(key);
+                this._spent.delete(key);
+            }
 
-            const newCol = new Array(this.rows).fill(-1);
+            const newCol = new Array(this.rows).fill(EMPTY_TYPE_ID);
             let destRow = this.rows - 1;
             for (let i = survivors.length - 1; i >= 0; i--) {
                 const s = survivors[i];
                 newCol[destRow] = s.typeId;
-                if (s.special) this.specials.set(Board.key(destRow, c), s.special);
-                moves.push({ col: c, fromRow: s.r, toRow: destRow, typeId: s.typeId, special: s.special });
+                const destKey = Board.key(destRow, c);
+                if (s.special) this.specials.set(destKey, s.special);
+                if (s.spent) this._spent.set(destKey, s.spent);
+                // Same row it was already in — nothing fell, nothing to report.
+                if (s.r !== destRow) {
+                    moves.push({ col: c, fromRow: s.r, toRow: destRow, typeId: s.typeId, special: s.special });
+                }
                 destRow--;
             }
 

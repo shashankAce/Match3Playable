@@ -117,8 +117,12 @@ export interface ActivationRule {
     repeatArea?: AreaSpec;
     /**
      * Whether another special's blast catching this one sets it off too.
-     * `false` for the Color Bomb: passively caught it's just a casualty, it
-     * only fires when deliberately swapped.
+     * `true` for the Color Bomb as well: passively caught, it has no swap
+     * partner to take a color from, so it hunts the board's own most common
+     * color instead (ties broken at random) and clears every candy of that
+     * color — a plain clear, never converting them into new specials the
+     * way a deliberate bomb+striped/bomb+wrapped swap does. See
+     * `Board._expandCaughtColorBomb`.
      */
     chainsWhenCaught: boolean;
     /**
@@ -333,9 +337,12 @@ export const rules: GameRules = {
         'striped-v': { area: { shape: 'column' }, repeats: 0, chainsWhenCaught: true, colorless: false },
         // 3x3, twice — the second blast fires a phase later, after the board refills.
         wrapped: { area: { shape: 'box', radius: 1 }, repeats: 1, chainsWhenCaught: true, colorless: false },
-        // No area of its own: a Color Bomb only ever acts through a `combos`
-        // rule, and caught in someone else's blast it's a casualty, not a chain.
-        'color-bomb': { area: { shape: 'box', radius: 0 }, repeats: 0, chainsWhenCaught: false, colorless: true },
+        // `area` here is unused for a passive catch — a Color Bomb has no
+        // fixed shape of its own, so `chainsWhenCaught: true` routes it
+        // through `Board._expandCaughtColorBomb`'s "board's most common
+        // color" hunt instead of this `area`. A deliberate swap still goes
+        // through a `combos` rule, never this table.
+        'color-bomb': { area: { shape: 'box', radius: 0 }, repeats: 0, chainsWhenCaught: true, colorless: true },
     },
 
     // Priority-ordered, highest first (again documentation only — `Board.ts`

@@ -25,6 +25,8 @@ const POP_UP_DURATION = 0.08;
 const POP_DOWN_DURATION = 0.12;
 const SPECIAL_POP_DURATION = 0.18;
 const SPECIAL_SETTLE_DURATION = 0.1;
+/** Half of the recoil a special gives when it detonates but survives to detonate again — see `BoardView._pulseTile`. */
+const SURVIVOR_PULSE_DURATION = 0.11;
 /**
  * How long a Color Bomb pass holds its cleared candies on screen (still
  * visible, not yet popping) before they start destroying — long enough that
@@ -110,6 +112,8 @@ export class BoardView {
     private dragging: {
         r: number; c: number; node: Node; origin: { x: number; y: number };
         target: { r: number; c: number; node: Node; origin: { x: number; y: number } } | null;
+        lockAxis: 'x' | 'y' | null;
+        lockSign: 1 | -1 | null;
     } | null = null;
 
     private score = 0;
@@ -192,7 +196,7 @@ export class BoardView {
             this.selected = null;
         }
 
-        this.dragging = { r, c, node, origin: this.cellCenter(r, c), target: null };
+        this.dragging = { r, c, node, origin: this.cellCenter(r, c), target: null, lockAxis: null, lockSign: null };
         node.zIndex = DRAG_ACTIVE_Z_INDEX;
     }
 
@@ -215,6 +219,15 @@ export class BoardView {
      * tracking the raw pointer vector: a candy only ever swaps into a
      * horizontal or vertical neighbor, so letting it visually drift
      * diagonally mid-drag never corresponds to a real swap target.
+     *
+     * The axis+sign picked on the first move is then held in
+     * `d.lockAxis`/`d.lockSign` for the rest of the gesture: any movement
+     * back past the origin is clamped to exactly 0 (the candy sits back at
+     * its own cell) rather than flipping the swap target to the opposite
+     * (or perpendicular) neighbor. The lock is only cleared by
+     * `_onDragStart` on the next fresh press — `_onSwipe`/drag end is what
+     * actually lets the user pick a new direction, by discarding `dragging`
+     * (and its lock) entirely.
      */
     private _onDragMove(r: number, c: number, e: any): void {
         const d = this.dragging;
@@ -222,8 +235,30 @@ export class BoardView {
 
         const dx = e.x - e.pointer.startX;
         const dy = e.y - e.pointer.startY;
-        const useX = Math.abs(dx) > Math.abs(dy);
-        const dist = useX ? dx : dy;
+
+        let useX: boolean;
+        let dist: number;
+        if (d.lockAxis) {
+            useX = d.lockAxis === 'x';
+            dist = useX ? dx : dy;
+            if (Math.sign(dist) !== d.lockSign) dist = 0;
+        } else {
+            useX = Math.abs(dx) > Math.abs(dy);
+            dist = useX ? dx : dy;
+        }
+
+        if (dist === 0) {
+            d.node.x = d.origin.x;
+            d.node.y = d.origin.y;
+            this._resetDragTarget(d);
+            return;
+        }
+
+        if (!d.lockAxis) {
+            d.lockAxis = useX ? 'x' : 'y';
+            d.lockSign = Math.sign(dist) as 1 | -1;
+        }
+
         const clamped = Math.max(-this.layout.tileSize, Math.min(this.layout.tileSize, dist));
         const ex = useX ? clamped : 0;
         const ey = useX ? 0 : clamped;
@@ -234,9 +269,9 @@ export class BoardView {
         let tr = r;
         let tc = c;
         if (useX) {
-            tc = c + (dx > 0 ? 1 : -1);
+            tc = c + (dist > 0 ? 1 : -1);
         } else {
-            tr = r + (dy > 0 ? -1 : 1);
+            tr = r + (dist > 0 ? -1 : 1);
         }
 
         if (!this.board.inBounds(tr, tc)) {
@@ -449,249 +484,321 @@ export class BoardView {
     }
 
     /**
-     * Polls `board.resolve()` until a pass clears nothing, animating each
-     * pass's pop/fall in between. `firstResult` lets a caller that already
-     * computed its own first pass (e.g. `activateSpecialSwap`, which isn't a
-     * normal color-match) feed it in directly instead of this method calling
-     * `resolve()` for that pass — every pass after the first still comes
-     * from `resolve()`, since a special activation can itself trigger a
-     * normal cascade afterward.
+     * Drives one player move to completion in the order the real game uses
+     * (see `Board`'s "The order of operations"): resolve the whole blast chain
+     * on a still board, one `resolve()` per beat, then drop everything in a
+     * single `settle()`, then look again — until a beat clears nothing.
+     *
+     * The two loops are deliberately not merged into one. A beat that catches
+     * a special defers it by board position, so slipping a fall in between
+     * would leave those positions pointing at whatever dropped into them —
+     * which is exactly why a Color Bomb caught in a striped candy's blast used
+     * to go off silently, having fallen out from under its own detonation.
+     *
+     * `firstResult` lets a caller that already computed the opening beat (e.g.
+     * `activateSpecialSwap`, which isn't a normal color match) feed it in
+     * instead of this method calling `resolve()` for it — every beat after
+     * that still comes from `resolve()`, since a special activation can
+     * trigger an ordinary cascade behind it.
      */
     private async _runCascade(preferredCells?: { r: number; c: number }[], firstResult?: ResolveResult): Promise<void> {
-        let first = true;
+        /** Nothing happened this beat — no clears and nothing detonated. */
+        const idle = (r: ResolveResult): boolean =>
+            r.cleared.length === 0 && r.activatedSpecials.length === 0;
+
+        let result = firstResult ?? this.board.resolve(preferredCells);
         for (;;) {
-            const result = first && firstResult ? firstResult : this.board.resolve(first ? preferredCells : undefined);
-            first = false;
-            if (result.cleared.length === 0) break;
+            if (!idle(result)) await this._playBeat(result);
 
-            const spawnedKeys = new Set(result.spawned.map(s => `${s.r},${s.c}`));
-            const activatedByKey = new Map(result.activatedSpecials.map(a => [`${a.r},${a.c}`, a]));
-
-            // A Color Bomb + striped/wrapped swap doesn't merely clear its
-            // targets: the rule is "every candy of that color *turns into*
-            // that special, then they all detonate" — two beats, reported by
-            // the model in a single pass (one `resolve()` is one visual pass,
-            // and splitting the rule across two model passes would let gravity
-            // run in between, which the real game doesn't do). So the view
-            // stages them here: fire the beam, let it reach its targets,
-            // re-frame each converted candy to the special it just became,
-            // hold long enough for a board full of stripes to read as such,
-            // and only then run the detonation below — which is itself
-            // staggered, wave by wave, via `cleared[].wave`. Skipping the beat
-            // is what made the combo look wrong — the candies kept their plain
-            // art and simply vanished while stripe beams fired out of nowhere.
-            const converted = result.colorBombBeam
-                ? result.activatedSpecials.filter(a => a.kind !== 'color-bomb')
-                : [];
-            const staged = converted.length > 0;
-            const popPromises: Promise<void>[] = [];
-            /**
-             * Seconds a given `wave` waits before it fires. A `stagedAreas`
-             * combo's beats are whole effects and need room to be read; every
-             * other stagger (a Color Bomb's conversions radiating outward, a
-             * bomb+bomb sweep crossing the columns) is one tile-beat apart and
-             * capped so a large one still finishes promptly.
-             */
-            const stageCount = result.comboBlast?.stages.length ?? 1;
-            const waveTime = (wave: number): number => (stageCount > 1
-                ? wave * COMBO_STAGE_DURATION
-                : Math.min(wave * DETONATION_STAGGER_DURATION, DETONATION_STAGGER_MAX));
-
-            // The swapped special a Color Bomb consumed goes *first*, before
-            // the beam: the swap registers its color and it's gone from its
-            // square, rather than sitting there through the beam and the
-            // conversion only to pop with everything else at the end.
-            const consumedKeys = new Set(result.consumed.map(p => `${p.r},${p.c}`));
-            const consumedPromises: Promise<void>[] = [];
-            for (const p of result.consumed) {
-                const node = this.nodes[p.r][p.c];
-                if (!node) continue;
-                this.nodes[p.r][p.c] = null;
-                // The color it had when it was taken, from `cleared` — the
-                // model has already run gravity, so its board cell now holds
-                // whatever fell into it.
-                const taken = result.cleared.find(cell => cell.r === p.r && cell.c === p.c);
-                if (taken) this._spawnPlainBurst(p.r, p.c, taken.typeId);
-                consumedPromises.push(
-                    AfterTween(
-                        Tween.create(node).to(CONSUMED_POP_DURATION, { scaleX: 0, scaleY: 0, opacity: 0 }, Easing.cubicIn)
-                    ).then(() => {
-                        node.removeFromParent();
-                        this.baseScale.delete(node);
-                    })
-                );
+            // Still inside one explosion: the next domino goes off against a
+            // board that hasn't moved, which is how it reads on screen.
+            if (this.board.hasQueuedBlast()) {
+                result = this.board.resolve();
+                continue;
             }
 
-            // Awaited, not merely started: the candy is gone *before* the
-            // lightning goes out, not fading out underneath it.
-            if (consumedPromises.length) await Promise.all(consumedPromises);
+            // The chain is dry — now, and only now, the board falls.
+            const moves = this.board.settle();
+            if (moves.length > 0) await this._playFall(moves);
 
-            // A swept beam is timed to the detonation waves it precedes, so it
-            // must hold only as long as the sweep takes; a staged conversion
-            // beam holds for the conversion; everything else uses the default.
-            const maxWave = result.cleared.reduce((m, cell) => Math.max(m, cell.wave), 0);
-            const sweepSpan = Math.min(maxWave * DETONATION_STAGGER_DURATION, DETONATION_STAGGER_MAX);
-            if (result.colorBombBeam) {
-                const hold = staged
-                    ? CONVERT_BEAM_HOLD_DURATION
-                    : result.colorBombBeam.sweep
-                        ? sweepSpan + SWEEP_BOLT_LIFETIME
-                        : undefined;
-                SpawnColorBombBeam(
-                    this.boardRoot, this.layout, result.colorBombBeam,
-                    hold, DETONATION_STAGGER_DURATION
-                );
-            }
-
-            if (staged) {
-                await Delay(CONVERT_BEAM_ARRIVE_DURATION);
-                for (const a of converted) {
-                    const node = this.nodes[a.r][a.c];
-                    if (!node) continue;
-                    const sprite = node.getComponent(Sprite) as Sprite;
-                    // a.typeId, not the board cell — same capture-before-mutation
-                    // rule `spawned` follows; the model has already run gravity.
-                    const base = this.applyFrame(node, sprite, a.typeId, a.kind);
-                    Tween.create(node)
-                        .to(CONVERT_POP_DURATION, { scaleX: base * 1.28, scaleY: base * 1.28 }, Easing.backOut)
-                        .to(CONVERT_SETTLE_DURATION, { scaleX: base, scaleY: base }, Easing.quadOut)
-                        .start();
-                }
-                await Delay(CONVERT_POP_DURATION + CONVERT_SETTLE_DURATION + CONVERT_HOLD_DURATION);
-            }
-
-            // A Color Bomb pass with nothing to convert (a plain-candy target)
-            // still holds its candies while the beam reaches them — see
-            // `COLOR_BOMB_POP_DELAY`'s doc. A staged pass has already spent
-            // that time on the conversion beat above, so it pops immediately,
-            // as does every non-beam pass.
-            const popDelay = !result.colorBombBeam || staged
-                ? 0
-                : result.colorBombBeam.sweep
-                    ? SWEEP_POP_LEAD_DURATION
-                    : COLOR_BOMB_POP_DELAY;
-
-            for (const cell of result.cleared) {
-                const key = `${cell.r},${cell.c}`;
-                if (spawnedKeys.has(key) || consumedKeys.has(key)) continue;
-
-                // Fire-and-forget visual flourish — never awaited, so it never
-                // affects cascade pacing. A cleared cell that was a detonating
-                // special gets that special's own burst shape; everything else
-                // (including every candy a Color Bomb's beam picked out) gets
-                // the plain small burst in its own color. A `'color-bomb'`-kind
-                // cell falls through to that same plain burst deliberately:
-                // the bomb's own cell holds the colorless sentinel id, so
-                // `_spawnPlainBurst` finds no color and skips — the beam
-                // effect already playing from that exact cell is its flourish.
-                // A staggered combo detonates in sequence — the model assigns
-                // each cell the beat that claimed it, so the effect and the
-                // pop for that cell both wait for it.
-                const waveDelay = waveTime(cell.wave);
-                const activated = activatedByKey.get(key);
-                const spawnEffect = (): void => {
-                    if (activated && activated.kind !== 'color-bomb') {
-                        this._spawnActivationEffect(activated.r, activated.c, activated.kind, activated.typeId);
-                    } else {
-                        this._spawnPlainBurst(cell.r, cell.c, cell.typeId);
-                    }
-                };
-                if (waveDelay > 0) void Delay(waveDelay).then(spawnEffect);
-                else spawnEffect();
-
-                const node = this.nodes[cell.r][cell.c];
-                if (!node) continue;
-                this.nodes[cell.r][cell.c] = null;
-                const base = this.baseScale.get(node) ?? 1;
-                popPromises.push(
-                    AfterTween(
-                        Tween.create(node)
-                            .delay(popDelay + waveDelay)
-                            .to(POP_UP_DURATION, { scaleX: base * 1.15, scaleY: base * 1.15 }, Easing.backOut)
-                            .to(POP_DOWN_DURATION, { scaleX: 0, scaleY: 0, opacity: 0 }, Easing.cubicIn)
-                    ).then(() => {
-                        node.removeFromParent();
-                        this.baseScale.delete(node);
-                    })
-                );
-            }
-
-            // A combo that asked to be drawn as one blast (`presentAsBlast`)
-            // reports the shape it actually cleared, so the cross / 5x5 /
-            // 3-wide cross is drawn as itself rather than as whichever two
-            // specials happened to be swapped into each other.
-            if (result.comboBlast) {
-                const blast = result.comboBlast;
-                const color = this._effectColorFor(blast.typeId);
-                for (const stage of blast.stages) {
-                    const at = waveTime(stage.wave);
-                    const draw = (): void => SpawnAreaEffect(
-                        this.boardRoot, this.layout, this.board.rows, this.board.cols,
-                        blast.r, blast.c, stage.area, color
-                    );
-                    if (at > 0) void Delay(at).then(draw);
-                    else draw();
-                }
-                if (blast.stages.length > 1 && blast.kind) {
-                    this._playComboCandy(blast.r, blast.c, blast.typeId, blast.kind, blast.stages.map(st => waveTime(st.wave)));
-                }
-            }
-
-            for (const s of result.spawned) {
-                const node = this.nodes[s.r][s.c];
-                if (!node) continue;
-                const sprite = node.getComponent(Sprite) as Sprite;
-                // s.typeId, not board.cells[s.r][s.c] — resolve() already ran
-                // gravity by the time we get here, so whatever fell into this
-                // (r,c) afterward would silently overwrite which color renders.
-                const base = this.applyFrame(node, sprite, s.typeId, s.special);
-                popPromises.push(
-                    AfterTween(
-                        Tween.create(node)
-                            .to(SPECIAL_POP_DURATION, { scaleX: base * 1.3, scaleY: base * 1.3 }, Easing.elasticOut)
-                            .to(SPECIAL_SETTLE_DURATION, { scaleX: base, scaleY: base }, Easing.quadOut)
-                    )
-                );
-            }
-
-            await Promise.all(popPromises);
-
-            const fallPromises: Promise<void>[] = [];
-            for (const move of result.moves) {
-                if (move.fromRow !== null) {
-                    const node = this.nodes[move.fromRow][move.col];
-                    this.nodes[move.fromRow][move.col] = null;
-                    if (!node) continue;
-                    this.nodes[move.toRow][move.col] = node;
-                    const target = this.cellCenter(move.toRow, move.col);
-                    fallPromises.push(AfterTween(Tween.create(node).to(FALL_DURATION, { x: target.x, y: target.y }, Easing.backOut)));
-                } else {
-                    const spawnStart = this.cellCenter(0, move.col);
-                    const node = new Node(spawnStart.x, this.layout.top + this.layout.tileSize);
-                    const sprite = node.addComponent(Sprite);
-                    this.applyFrame(node, sprite, move.typeId, null);
-                    this.boardRoot.addChild(node);
-                    this.nodes[move.toRow][move.col] = node;
-                    const target = this.cellCenter(move.toRow, move.col);
-                    fallPromises.push(AfterTween(Tween.create(node).to(FALL_DURATION, { x: target.x, y: target.y }, Easing.backOut)));
-                }
-            }
-
-            await Promise.all(fallPromises);
-
-            this.score += result.scoreDelta;
-            this.onScoreChange?.(this.score);
-
-            if (rules.winCondition.mode === 'collect') {
-                for (const cell of result.cleared) {
-                    const left = this.remaining.get(cell.typeId);
-                    if (left !== undefined) this.remaining.set(cell.typeId, Math.max(0, left - 1));
-                }
-                this.onCollectChange?.(this.remaining);
-            }
-
+            // The post-fall beat: repeats owed by anything that survived its
+            // own blast, a combo's queued second wave, and whatever match the
+            // fall happened to create.
+            result = this.board.resolve();
+            if (idle(result) && !this.board.hasQueuedBlast()) break;
             await Delay(0.05);
         }
+    }
+
+    /**
+     * One beat of a blast chain, animated: the detonation effects, the pops,
+     * and the scoring for it. Runs against a board that has already applied
+     * this beat's clears but has *not* fallen — `_playFall` is a separate
+     * step, called once the whole chain is spent.
+     */
+    private async _playBeat(result: ResolveResult): Promise<void> {
+        const spawnedKeys = new Set(result.spawned.map(s => `${s.r},${s.c}`));
+        const activatedByKey = new Map(result.activatedSpecials.map(a => [`${a.r},${a.c}`, a]));
+
+        // A Color Bomb + striped/wrapped swap doesn't merely clear its
+        // targets: the rule is "every candy of that color *turns into*
+        // that special, then they all detonate" — two beats the model reports
+        // as one, since the conversion changes nothing about which cells go.
+        // So the view stages them here: fire the beam, let it reach its targets,
+        // re-frame each converted candy to the special it just became,
+        // hold long enough for a board full of stripes to read as such,
+        // and only then run the detonation below — which is itself
+        // staggered, wave by wave, via `cleared[].wave`. Skipping the beat
+        // is what made the combo look wrong — the candies kept their plain
+        // art and simply vanished while stripe beams fired out of nowhere.
+        const converted = result.colorBombBeam
+            ? result.activatedSpecials.filter(a => a.kind !== 'color-bomb')
+            : [];
+        const staged = converted.length > 0;
+        const popPromises: Promise<void>[] = [];
+        /**
+         * Seconds a given `wave` waits before it fires. A `stagedAreas`
+         * combo's beats are whole effects and need room to be read; every
+         * other stagger (a Color Bomb's conversions radiating outward, a
+         * bomb+bomb sweep crossing the columns) is one tile-beat apart and
+         * capped so a large one still finishes promptly.
+         */
+        const stageCount = result.comboBlast?.stages.length ?? 1;
+        const waveTime = (wave: number): number => (stageCount > 1
+            ? wave * COMBO_STAGE_DURATION
+            : Math.min(wave * DETONATION_STAGGER_DURATION, DETONATION_STAGGER_MAX));
+
+        // The swapped special a Color Bomb consumed goes *first*, before
+        // the beam: the swap registers its color and it's gone from its
+        // square, rather than sitting there through the beam and the
+        // conversion only to pop with everything else at the end.
+        const consumedKeys = new Set(result.consumed.map(p => `${p.r},${p.c}`));
+        const consumedPromises: Promise<void>[] = [];
+        for (const p of result.consumed) {
+            const node = this.nodes[p.r][p.c];
+            if (!node) continue;
+            this.nodes[p.r][p.c] = null;
+            // The color it had when it was taken, read from `cleared` rather
+            // than the board: the model has already blanked its cell.
+            const taken = result.cleared.find(cell => cell.r === p.r && cell.c === p.c);
+            if (taken) this._spawnPlainBurst(p.r, p.c, taken.typeId);
+            consumedPromises.push(
+                AfterTween(
+                    Tween.create(node).to(CONSUMED_POP_DURATION, { scaleX: 0, scaleY: 0, opacity: 0 }, Easing.cubicIn)
+                ).then(() => {
+                    node.removeFromParent();
+                    this.baseScale.delete(node);
+                })
+            );
+        }
+
+        // Awaited, not merely started: the candy is gone *before* the
+        // lightning goes out, not fading out underneath it.
+        if (consumedPromises.length) await Promise.all(consumedPromises);
+
+        // A swept beam is timed to the detonation waves it precedes, so it
+        // must hold only as long as the sweep takes; a staged conversion
+        // beam holds for the conversion; everything else uses the default.
+        const maxWave = result.cleared.reduce((m, cell) => Math.max(m, cell.wave), 0);
+        const sweepSpan = Math.min(maxWave * DETONATION_STAGGER_DURATION, DETONATION_STAGGER_MAX);
+        if (result.colorBombBeam) {
+            const hold = staged
+                ? CONVERT_BEAM_HOLD_DURATION
+                : result.colorBombBeam.sweep
+                    ? sweepSpan + SWEEP_BOLT_LIFETIME
+                    : undefined;
+            SpawnColorBombBeam(
+                this.boardRoot, this.layout, result.colorBombBeam,
+                hold, DETONATION_STAGGER_DURATION
+            );
+        }
+
+        if (staged) {
+            await Delay(CONVERT_BEAM_ARRIVE_DURATION);
+            for (const a of converted) {
+                const node = this.nodes[a.r][a.c];
+                if (!node) continue;
+                const sprite = node.getComponent(Sprite) as Sprite;
+                // a.typeId, not the board cell — same capture-before-mutation
+                // rule `spawned` follows.
+                const base = this.applyFrame(node, sprite, a.typeId, a.kind);
+                Tween.create(node)
+                    .to(CONVERT_POP_DURATION, { scaleX: base * 1.28, scaleY: base * 1.28 }, Easing.backOut)
+                    .to(CONVERT_SETTLE_DURATION, { scaleX: base, scaleY: base }, Easing.quadOut)
+                    .start();
+            }
+            await Delay(CONVERT_POP_DURATION + CONVERT_SETTLE_DURATION + CONVERT_HOLD_DURATION);
+        }
+
+        // A Color Bomb pass with nothing to convert (a plain-candy target)
+        // still holds its candies while the beam reaches them — see
+        // `COLOR_BOMB_POP_DELAY`'s doc. A staged pass has already spent
+        // that time on the conversion beat above, so it pops immediately,
+        // as does every non-beam pass.
+        const popDelay = !result.colorBombBeam || staged
+            ? 0
+            : result.colorBombBeam.sweep
+                ? SWEEP_POP_LEAD_DURATION
+                : COLOR_BOMB_POP_DELAY;
+
+        for (const cell of result.cleared) {
+            const key = `${cell.r},${cell.c}`;
+            if (spawnedKeys.has(key) || consumedKeys.has(key)) continue;
+
+            // Fire-and-forget visual flourish — never awaited, so it never
+            // affects cascade pacing. A cleared cell that was a detonating
+            // special gets that special's own burst shape; everything else
+            // (including every candy a Color Bomb's beam picked out) gets
+            // the plain small burst in its own color. A `'color-bomb'`-kind
+            // cell falls through to that same plain burst deliberately:
+            // the bomb's own cell holds the colorless sentinel id, so
+            // `_spawnPlainBurst` finds no color and skips — the beam
+            // effect already playing from that exact cell is its flourish.
+            // A staggered combo detonates in sequence — the model assigns
+            // each cell the beat that claimed it, so the effect and the
+            // pop for that cell both wait for it.
+            const waveDelay = waveTime(cell.wave);
+            const activated = activatedByKey.get(key);
+            const spawnEffect = (): void => {
+                if (activated && activated.kind !== 'color-bomb') {
+                    this._spawnActivationEffect(activated.r, activated.c, activated.kind, activated.typeId);
+                } else {
+                    this._spawnPlainBurst(cell.r, cell.c, cell.typeId);
+                }
+            };
+            if (waveDelay > 0) void Delay(waveDelay).then(spawnEffect);
+            else spawnEffect();
+
+            const node = this.nodes[cell.r][cell.c];
+            if (!node) continue;
+            this.nodes[cell.r][cell.c] = null;
+            const base = this.baseScale.get(node) ?? 1;
+            popPromises.push(
+                AfterTween(
+                    Tween.create(node)
+                        .delay(popDelay + waveDelay)
+                        .to(POP_UP_DURATION, { scaleX: base * 1.15, scaleY: base * 1.15 }, Easing.backOut)
+                        .to(POP_DOWN_DURATION, { scaleX: 0, scaleY: 0, opacity: 0 }, Easing.cubicIn)
+                ).then(() => {
+                    node.removeFromParent();
+                    this.baseScale.delete(node);
+                })
+            );
+        }
+
+        // A combo that asked to be drawn as one blast (`presentAsBlast`)
+        // reports the shape it actually cleared, so the cross / 5x5 /
+        // 3-wide cross is drawn as itself rather than as whichever two
+        // specials happened to be swapped into each other.
+        if (result.comboBlast) {
+            const blast = result.comboBlast;
+            const color = this._effectColorFor(blast.typeId);
+            for (const stage of blast.stages) {
+                const at = waveTime(stage.wave);
+                const draw = (): void => SpawnAreaEffect(
+                    this.boardRoot, this.layout, this.board.rows, this.board.cols,
+                    blast.r, blast.c, stage.area, color
+                );
+                if (at > 0) void Delay(at).then(draw);
+                else draw();
+            }
+            if (blast.stages.length > 1 && blast.kind) {
+                this._playComboCandy(blast.r, blast.c, blast.typeId, blast.kind, blast.stages.map(st => waveTime(st.wave)));
+            }
+        }
+
+        for (const s of result.spawned) {
+            const node = this.nodes[s.r][s.c];
+            if (!node) continue;
+            const sprite = node.getComponent(Sprite) as Sprite;
+            // s.typeId, not board.cells[s.r][s.c] — the next `settle()` can
+            // move this tile, and whatever falls into its old (r,c) would then
+            // silently overwrite which color renders.
+            const base = this.applyFrame(node, sprite, s.typeId, s.special);
+            popPromises.push(
+                AfterTween(
+                    Tween.create(node)
+                        .to(SPECIAL_POP_DURATION, { scaleX: base * 1.3, scaleY: base * 1.3 }, Easing.elasticOut)
+                        .to(SPECIAL_SETTLE_DURATION, { scaleX: base, scaleY: base }, Easing.quadOut)
+                )
+            );
+        }
+
+        // A special that fired but is still standing — a Wrapped Candy part
+        // way through its double explosion — is deliberately absent from
+        // `cleared`, since its tile survives to go off again. Its effect still
+        // has to play, and it gets a recoil pulse so it visibly took part
+        // instead of sitting inert while everything around it pops.
+        const clearedKeys = new Set(result.cleared.map(cell => `${cell.r},${cell.c}`));
+        for (const a of result.activatedSpecials) {
+            if (clearedKeys.has(`${a.r},${a.c}`) || a.kind === 'color-bomb') continue;
+            const at = waveTime(a.wave);
+            const play = (): void => {
+                this._spawnActivationEffect(a.r, a.c, a.kind, a.typeId);
+                this._pulseTile(a.r, a.c);
+            };
+            if (at > 0) void Delay(at).then(play);
+            else play();
+        }
+
+        await Promise.all(popPromises);
+
+        this.score += result.scoreDelta;
+        this.onScoreChange?.(this.score);
+
+        if (rules.winCondition.mode === 'collect') {
+            for (const cell of result.cleared) {
+                const left = this.remaining.get(cell.typeId);
+                if (left !== undefined) this.remaining.set(cell.typeId, Math.max(0, left - 1));
+            }
+            this.onCollectChange?.(this.remaining);
+        }
+    }
+
+    /**
+     * The fall, animated: surviving tiles slide to the rows `settle()` gave
+     * them and fresh candies drop in from above the board. One call per
+     * cascade level — a whole blast chain has already finished by the time
+     * this runs.
+     */
+    private async _playFall(moves: ColumnMove[]): Promise<void> {
+        const fallPromises: Promise<void>[] = [];
+        for (const move of moves) {
+            if (move.fromRow !== null) {
+                const node = this.nodes[move.fromRow][move.col];
+                this.nodes[move.fromRow][move.col] = null;
+                if (!node) continue;
+                this.nodes[move.toRow][move.col] = node;
+                const target = this.cellCenter(move.toRow, move.col);
+                fallPromises.push(AfterTween(Tween.create(node).to(FALL_DURATION, { x: target.x, y: target.y }, Easing.backOut)));
+            } else {
+                const spawnStart = this.cellCenter(0, move.col);
+                const node = new Node(spawnStart.x, this.layout.top + this.layout.tileSize);
+                const sprite = node.addComponent(Sprite);
+                this.applyFrame(node, sprite, move.typeId, null);
+                this.boardRoot.addChild(node);
+                this.nodes[move.toRow][move.col] = node;
+                const target = this.cellCenter(move.toRow, move.col);
+                fallPromises.push(AfterTween(Tween.create(node).to(FALL_DURATION, { x: target.x, y: target.y }, Easing.backOut)));
+            }
+        }
+
+        await Promise.all(fallPromises);
+    }
+
+    /**
+     * A quick recoil on a tile that just detonated and is *still there* — a
+     * Wrapped Candy between its two explosions. Fire-and-forget, like the
+     * burst effects: it never gates cascade pacing.
+     */
+    private _pulseTile(r: number, c: number): void {
+        const node = this.nodes[r][c];
+        if (!node) return;
+        const base = this.baseScale.get(node) ?? 1;
+        Tween.create(node)
+            .to(SURVIVOR_PULSE_DURATION, { scaleX: base * 1.32, scaleY: base * 1.32 }, Easing.backOut)
+            .to(SURVIVOR_PULSE_DURATION, { scaleX: base, scaleY: base }, Easing.quadOut)
+            .start();
     }
 
     /** Small radial puff at a plain match's cell — the "3-match" effect. */

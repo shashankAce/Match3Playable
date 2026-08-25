@@ -51,11 +51,14 @@ reskin might want the same *rules* with new art, or the same art with new
       Crush's counterintuitive orientation rule; `'striped-aligned'` is
       there so a reskin can flip it without touching `Board.ts`.
     - **`activation`** — what one special does when it goes off: the `area`
-      it clears (an `AreaSpec`, see below), how many times it re-detonates a
-      phase later (`repeats` — Wrapped Candy's double explosion),
-      whether another special's blast sets it off (`chainsWhenCaught` —
-      `false` for the Color Bomb), and whether it holds a real color at all
-      (`colorless`).
+      it clears (an `AreaSpec`, see below), how many extra times it detonates
+      after the board has fallen (`repeats` — Wrapped Candy's double
+      explosion; a non-zero value also means the tile *survives* its own
+      blast, so the repeat follows the candy rather than its old square),
+      whether another special's blast sets it off (`chainsWhenCaught` — `true`
+      for every kind, including the Color Bomb, which hunts the board's most
+      common color instead of a fixed `area` when caught this way), and
+      whether it holds a real color at all (`colorless`).
     - **`combos`** — what a deliberate swap of two specials does, again
       priority-ordered (Color Bomb + Color Bomb has to outrank the looser
       Color Bomb + anything). A pair matching *no* rule here isn't a combo
@@ -202,13 +205,14 @@ skipped:
 - **A spawned special's color/type must be captured at spawn time, in
   `Board.resolve()`'s own `spawned` array — never re-read from
   `board.cells[r][c]` afterward.** This was a real bug (matching 4 blue
-  tiles rendered *red* stripes): `resolve()` runs gravity/refill on the same
-  call before returning, and gravity can move the just-spawned special to a
-  different row in its column; whatever value falls into its *old* (r,c)
-  afterward has nothing to do with the special's own color. `spawned` now
-  carries `typeId` explicitly (from the matched run's own `typeId`, known
-  before gravity touches anything) precisely so `BoardView` never needs to
-  re-derive it from post-gravity board state. Confirmed fixed by logging
+  tiles rendered *red* stripes): the next `Board.settle()` can move the
+  just-spawned special to a different row in its column, and whatever value
+  falls into its *old* (r,c) afterward has nothing to do with the special's
+  own color. `spawned` now carries `typeId` explicitly (from the matched run's
+  own `typeId`, known before anything falls) precisely so `BoardView` never
+  needs to re-derive it from post-gravity board state. (`resolve()` used to run
+  gravity itself, on the same call, which made this trap much easier to fall
+  into; it no longer does — see "Order of operations" below.) Confirmed fixed by logging
   every spawn's `(typeId, chosen frame)` pair across a live swipe sweep and
   checking each against `theme.ts`'s mapping by hand — all consistent.
 - **No deadlock detection.** If a generated/cascaded board ends up with zero
@@ -252,6 +256,34 @@ skipped:
   guide, Unity Ads' playable end-card docs) that every major network's own
   host container draws that control, not the creative; this doc previously
   only had that confirmed for AppLovin/Unity's MRAID path specifically.
+- **Blast chains resolve before gravity, and wrapped repeats follow the candy
+  (2026-08-25)** — the reported symptom was a Color Bomb sitting in a striped
+  candy's blast path and simply doing nothing. The cause was ordering:
+  `resolve()` cleared *and* ran gravity in a single call, while a chain
+  reaction defers a caught special to the next call **by board position**. The
+  deferred bomb was correctly left standing, then fell a row as the refill
+  collapsed the column under it, and the next call looked up its old cell,
+  found a fresh candy with no special, and dropped the detonation silently.
+  Fixed by splitting the model: `resolve()` is one beat with no gravity,
+  `settle()` is the fall, and `BoardView._runCascade` runs the blast chain to
+  completion on a still board before settling — which is what the real game
+  does anyway (see "Order of operations"). The same bug made a Wrapped Candy's
+  second explosion fire at the square it had already left, so tile-bound
+  repeats moved from queued positions to `_spent` board state that
+  `_collapseAndRefill` re-keys as the tile falls; a wrapped tile now survives
+  its own first blast the way it does in the real game, drops, and goes off
+  again from where it lands. Removing gravity from `resolve()` exposed two
+  more bugs that had been masked by it: mid-chain holes (`EMPTY_TYPE_ID`) were
+  being read as a matchable color by `_findRuns`, and a surviving special
+  re-triggered itself via `_catchBystanders` and marched down its column
+  exploding forever (`_isColor` and `_hasHadItsTurn` respectively). Verified
+  with the standalone `Board`-model method — 40 assertions including the
+  reported scenario reproduced directly, the wrapped double-blast's position
+  and fall ordering, and every `?layout=` swept over every adjacent swap for
+  hangs/holes/off-board specials — plus a before/after beat-structure diff
+  against the previous model showing every documented cleared-cell count
+  unchanged. `?layout=colorbomb-bystander` is the layout that shows the
+  original bug's exact shape.
 - **Striped + Wrapped choreographed as three beats (2026-08-25)** — the
   combo cleared the right 39 cells but presented them as one flat blast. It
   now plays the way the real game does: the wrapped half's **3x3** goes off,
@@ -352,10 +384,9 @@ skipped:
   same way `_areaCells` clips it, so a 3x3 in a corner shows its 4 real cells
   and a 5x5 is visibly five wide. Color Bomb + striped/wrapped additionally
   got its missing **conversion beat**: the rule is "every candy of that color
-  *turns into* that special, then they all detonate", which is two beats
-  reported in one model pass (splitting it across two `resolve()` calls would
-  let gravity run in between, which the real game doesn't do), so
-  `_runCascade` stages it in the view — beam travels, each caught candy is
+  *turns into* that special, then they all detonate", which is two beats the
+  model reports as one (the conversion changes nothing about which cells go), so
+  `BoardView._playBeat` stages it in the view — beam travels, each caught candy is
   re-framed to the special it became and pops, the board sits full of
   stripes/wrapped candies for a beat, and only then do they go off.
   `SpawnColorBombBeam` takes an optional shorter `holdDuration` for that path
@@ -413,7 +444,10 @@ skipped:
   can force a second explosion on the *next* pass, after gravity has
   refilled the board (there was no way to express "explode, wait for
   refill, explode again at the same spot" with `resolve()`'s prior
-  single-pass shape). Verified the same way the original combo matrix was
+  single-pass shape). *(That queue has since been split in two and the
+  tile-bound half replaced by `_spent` board state — see "Order of operations"
+  below for the shape it has now, and why storing a repeat as a fixed board
+  position turned out to be the wrong model.)* Verified the same way the original combo matrix was
   (standalone `tsc`-compiled `Board`, hand-set `cells`/`specials`,
   assertions on `resolve()`/`activateSpecialSwap()` — see "Verification
   approach used" below) — six scenarios covering all four fixes, re-run
@@ -545,10 +579,12 @@ game's, not claimed to be pixel-exact except where noted):
 - Wrapped + Wrapped → a bigger area, a `box` of radius 2 instead of the
   lone wrapped tile's radius 1 (25 cells), that **explodes twice**
   — matches candy_crush_rules.md's "5x5 blast area that explodes twice"
-  exactly (previously a single explosion; the second explosion is queued via
-  `Board`'s `PendingAction` queue, described below, and fires on the very
-  next `resolve()` pass, after gravity has refilled the first blast). Both
-  explosions verified directly.
+  exactly (previously a single explosion). The second explosion is queued as a
+  `'burst'` `PendingAction` on `Board`'s `_settledQueue` and fires after the
+  fall. It is deliberately **positional**, not tile-bound: it re-detonates the
+  same 5x5 of board squares, whatever has since dropped into them, which is
+  what the blast site doing it twice actually looks like. Both explosions
+  verified directly.
 - Color Bomb + Striped/Wrapped → every candy of the *other* candy's color is
   cleared, each also triggering that special's own area from its own
   position ("they all turn into that special and detonate") — verified
@@ -556,9 +592,11 @@ game's, not claimed to be pixel-exact except where noted):
   random orientation (`rules.combos`' `spreadPartnerActivation.stripeOrientation`),
   so the board clears in a mix of rows and columns the way the real game does,
   rather than every one of them copying the swapped tile's direction. When the other special is **Wrapped**
-  specifically, each of those wrapped detonations **double-explodes** (queued
-  the same way as a standalone Wrapped+Wrapped) — and that double explosion
-  *is* the combo's famous "two waves". `candy_crush_rules.md` §4 additionally
+  specifically, each converted candy **double-explodes**: every one of them
+  blasts, the survivors ride the fall, and they all blast again from wherever
+  they land — and that double explosion *is* the combo's famous "two waves".
+  It comes for free from the `_spent` mechanism below, since a converted candy
+  is detonated *as* a Wrapped Candy and so inherits its `repeats`. `candy_crush_rules.md` §4 additionally
   claims a **second random color** gets the same treatment once the first
   settles, and that was implemented as a `'colorSweep'` `PendingAction` for a
   while; it was **removed 2026-08-25** after checking against the live game,
@@ -572,34 +610,86 @@ game's, not claimed to be pixel-exact except where noted):
 - Color Bomb + a normal candy → clears every candy of that normal candy's
   color — verified directly (the exact mechanism: `rules.combos`' `bomb+any`
   rule, whose `'same-color'` `AreaSpec` scans `cells` for matching `typeId`).
-- **Any wrapped detonation always double-explodes** — not just the
-  Wrapped+Wrapped and Wrapped+Color-Bomb combos above, but a lone wrapped
-  tile too, whether caught passively in another special's blast, or
-  activated via the swap-activation rule above (its own-color match at its
-  new cell). `_expandCaught`/`_drainPending` queue the second explosion at
-  the same origin cell whenever a `'wrapped'` bystander detonates;
-  `Board.resolve()` drains that queue (`Board._drainPending()`) at the start
-  of its very next call, against whatever fell into that spot by then. This
-  is the `PendingAction` mechanism referenced throughout this section — see
-  its own doc comment in `Board.ts` for the full contract.
+- **Any wrapped detonation always double-explodes, and the second blast
+  follows the candy** — not just the Wrapped+Wrapped and Wrapped+Color-Bomb
+  combos above, but a lone wrapped tile too, whether caught passively in
+  another special's blast or activated via the swap-activation rule above (its
+  own-color match at its new cell). The mechanism is `Board._spendDetonation`:
+  a special whose `rules.activation[].repeats` is non-zero is **not consumed by
+  its own blast**. Its own cell is held back from the clear, it stays a
+  registered special (keeping its art), it rides gravity like any other tile,
+  and `settle()` marks it due so the next `resolve()` fires it again from
+  wherever it landed — Candy Crush's "explodes, drops down as board pieces fill
+  in, and explodes a second time", including the drop.
+
+  That state lives in `Board`'s `_spent` map, keyed by cell and **re-keyed by
+  `_collapseAndRefill` as the tile falls** — deliberately board state rather
+  than a queued action. Modelling a repeat as a queued board *position* is what
+  it used to be, and it was wrong: the candy fell out from under its own queued
+  explosion, which then fired at the square it had left. A special that has
+  already had its turn (`_hasHadItsTurn` — `_fired` this beat, or `_spent` from
+  an earlier one) is never treated as a fresh domino by any catch path; without
+  that, a Wrapped Candy is re-triggered by the blast it just fired and never
+  finishes dying.
 - A special caught *passively* in another special's blast (not deliberately
-  swapped) always just clears as a bystander — a Color Bomb never
-  chain-reacts this way (`_catchBystanders` explicitly skips it), since it
-  has no fixed "area of its own" the way striped/wrapped do.
-- **Chain reactions resolve as a sequence of phases, not one flattened
+  swapped) chain-reacts too, striped/wrapped via their own fixed `area`. A
+  Color Bomb has no fixed area of its own to look up, so caught this way it
+  hunts the board's own most common color instead (`Board._mostCommonTypeId`,
+  ties broken at random) and clears every candy of that color — matching the
+  real game, corrected 2026-08-25 after this doc previously (incorrectly)
+  claimed a passively-caught Color Bomb never chain-reacts at all. Unlike a
+  deliberate bomb+striped/bomb+wrapped swap, this never converts the cleared
+  candies into new specials — see `Board._expandCaughtColorBomb`.
+- **Chain reactions resolve as a sequence of beats, not one flattened
   instant** — a bystander directly part of the *originally* matched/forced
-  cells activates immediately (its own area clears the same phase, one
-  visual beat, same as before), but anything that activation's own area
-  newly *reveals* (a different special sitting somewhere within its sweep,
-  not part of the original cells) is left untouched and deferred to the
-  *next* `resolve()` call instead of being expanded in the same instant —
-  `Board._catchBystanders`/`_expandCaught`, replacing the old
-  `_floodDetonate` recursive flood-fill. `BoardView._runCascade`'s existing
-  per-`resolve()`-call loop already animates each phase as its own beat with
-  no changes needed there. This is also why a freshly-created special (from
-  `resolve()`'s `registerSpawn`) is destroyed, never protected, if caught
-  this way — matching real Candy Crush — but the *chain reaction it in turn
-  causes* is its own later beat, not simultaneous with its own destruction.
+  cells activates immediately (its own area clears the same beat, one visual
+  beat, same as before), but anything that activation's own area newly
+  *reveals* (a different special sitting somewhere within its sweep, not part
+  of the original cells) is left untouched and deferred to the *next*
+  `resolve()` call instead of being expanded in the same instant —
+  `Board._catchBystanders`/`_expandCaught`, replacing the old `_floodDetonate`
+  recursive flood-fill. This is also why a freshly-created special (from
+  `resolve()`'s `registerSpawn`) is destroyed, never protected, if caught this
+  way — matching real Candy Crush — but the *chain reaction it in turn causes*
+  is its own later beat, not simultaneous with its own destruction.
+- **Order of operations: the whole blast chain resolves on a still board, and
+  only then does anything fall.** Candy Crush's timing is specific about this —
+  detonate a striped candy into a wrapped candy and the wrapped goes off a beat
+  later with nothing yet having moved. Gravity is the boundary between "this
+  explosion finished resolving" and "the board settles and we look for new
+  matches", which makes the loop nested rather than flat:
+
+  ```
+  MOVE
+  ├─ combo pair? → activateSpecialSwap() seeds the blast
+  │  else        → hasAnyMatch(); no match = revert, move over
+  └─ CASCADE LOOP
+     ├─ BLAST LOOP                       ← no gravity anywhere inside
+     │    resolve()  beat 0: matched runs clear, specials spawn
+     │    resolve()  beat 1: specials caught by beat 0 detonate
+     │    …while board.hasQueuedBlast(), i.e. until a beat catches nothing new
+     ├─ settle()                         ← gravity + refill, once
+     └─ resolve()   post-fall: `_spent` repeats + `_settledQueue`
+                    + any new match the fall created → loop, else move ends
+  ```
+
+  So **`resolve()` does not run gravity** — `settle()` does, and
+  `BoardView._runCascade` drives the two in that order (`_playBeat` animates a
+  beat, `_playFall` animates the fall). `resolve()` used to do both, and that is
+  not a cosmetic difference: a deferred catch names a board *cell*, so letting
+  gravity run between the beats invalidated every one of those positions and the
+  deferred detonation silently vanished. Fixed 2026-08-25 — a Color Bomb caught
+  in a striped candy's blast was the everyday way to see it (the stripe fired,
+  the bomb dropped a row, and nothing happened); `?layout=colorbomb-bystander`
+  is that exact shape. Two corollaries worth knowing before touching this code:
+  - Cleared cells hold `EMPTY_TYPE_ID` and **stay empty until `settle()`**, so
+    every mid-chain scan sees a board full of holes. Nothing may treat that
+    sentinel as a color — `Board._isColor` is the guard, and without it three
+    cells cleared in a row read as a three-match of nothing and an L of them
+    spawned a Wrapped Candy whose color was the sentinel.
+  - The cascade multiplier advances once per **fall** (in `settle()`), not once
+    per beat — a chain reaction's separate beats are one cascade level, not
+    several.
 - **Not implemented**: the two swapped cells' *own* special entries are
   deleted from `Board.specials` before flooding, specifically so they don't
   *also* independently re-contribute their own base area as if they were an
@@ -649,8 +739,10 @@ other), and `colorbomb-activate` (added 2026-08-24 — a Color Bomb next to
 a plain candy, plus scattered same-typeId singletons elsewhere on the
 board, to exercise the Color Bomb's own activation and its "lightning"
 beam effect without needing a rare 5-match to happen first). Confirmed
-live: `?layout=colorbomb` + the swap scored exactly 40 (4 cleared cells,
-matching the standalone test); `?layout=combo` + the swap scored exactly
+live: `?layout=colorbomb` + the swap cleared exactly 4 cells, matching the
+standalone test (it scores 240 — 4 x `pointsPerTile` plus the Color Bomb's
+200 `specialCreateBonus`; this doc claimed "exactly 40" for a while, from
+before that bonus existed); `?layout=combo` + the swap scored exactly
 390 (39 cleared cells, also matching); `?layout=colorbomb-activate` + the
 swap correctly decremented the collect-mode target by the cleared count
 and rendered a beam line to every same-color cell on the board.

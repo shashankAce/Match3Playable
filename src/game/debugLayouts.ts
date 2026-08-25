@@ -24,8 +24,9 @@
  * | `striped-v-4match` | (2,2)<->(2,3) | 4-run spawns a **striped-h** at (2,2) |
  * | `colorbomb` | (4,2)<->(5,2) | 5-run spawns a **Color Bomb** at (4,2) |
  * | `colorbomb-beats-wrapped` | (4,2)<->(5,2) | priority check: **Color Bomb**, not Wrapped, despite the crossing 3-run |
- * | `striped-bystander` | (3,2)<->(4,2) | two beats: row sweep, then the deferred striped-v sweeps its column |
- * | `wrapped-bystander` | (3,2)<->(4,2) | wrapped caught in a plain match: **3x3** panel, then a second 3x3 one pass later |
+ * | `striped-bystander` | (3,2)<->(4,2) | two beats on a still board: row sweep, then the deferred striped-v sweeps its column, and only then the fall |
+ * | `wrapped-bystander` | (3,2)<->(4,2) | wrapped caught in a plain match: **3x3** panel, the candy survives, the board falls, then a second 3x3 from where it landed |
+ * | `colorbomb-bystander` | (3,2)<->(4,2) | wrapped's 3x3 catches a Color Bomb at (5,1), which fires on the next beat **before any fall** — its own beam, clearing the board's most common color, **not** a plain casualty |
  * | `colorbomb-activate` | (4,4)<->(4,5) | every type-0 candy clears; beam from the bomb's sprite, ring on each target **including the swapped candy** |
  * | `colorbomb-striped` | (4,4)<->(4,5) | every type-0 candy detonates as a stripe, each with **its own random orientation** (rows *and* columns clear) |
  * | `colorbomb-wrapped` | (4,4)<->(4,5) | every type-0 candy 3x3-blasts twice, then a **second random color** does the same |
@@ -345,8 +346,12 @@ const comboWrappedWrapped: DebugLayout = {
  * wrapped tile's own cell, so it activates as a caught bystander. The wrapped
  * counterpart to `stripedBystanderCatch`, and the only layout that exercises a
  * *lone* wrapped detonation (every other wrapped scenario here goes through a
- * combo): pass 1 clears the match plus a 3x3 around (4,1), and one pass later
- * the same 3x3 explodes again — `rules.activation.wrapped.repeats`.
+ * combo): beat 1 clears the match plus a 3x3 around (4,1) while the wrapped
+ * tile itself *stays on the board*, then the board falls, then it explodes a
+ * second time from wherever it landed — `rules.activation.wrapped.repeats`,
+ * and Candy Crush's "explodes, drops down as board pieces fill in, and
+ * explodes a second time". Watch that the second blast is centred on the
+ * candy, not on (4,1).
  */
 const wrappedBystanderCatch: DebugLayout = {
     cells: (() => {
@@ -357,6 +362,40 @@ const wrappedBystanderCatch: DebugLayout = {
     })(),
     specials: [
         ['4,1', 'wrapped'],
+    ],
+};
+
+/**
+ * Same board/swap as `wrappedBystanderCatch`, plus a Color Bomb at (5,1)
+ * sitting inside the wrapped tile's 3x3 blast at (4,1) — swap (3,2)<->(4,2)
+ * exactly as before. Verifies a passively-caught Color Bomb explodes like a
+ * Color Bomb (hunts the board's most common color and clears it, firing its
+ * own beam) instead of vanishing as a plain casualty of the wrapped blast —
+ * see AGENTS.md's `chainsWhenCaught` note and `Board._expandCaughtColorBomb`.
+ *
+ * - Beat 1: the match clears, and the wrapped tile at (4,1) — directly part
+ *   of the matched run — fires its first 3x3, which reaches (5,1) but only
+ *   *reveals* the bomb there (a different special, not part of the original
+ *   matched snapshot) — deferred to the next beat, same as any other
+ *   newly-revealed special.
+ * - Beat 2, on a board that has **not** moved: the deferred Color Bomb fires
+ *   from (5,1), beam and all, and clears whichever color has the most tiles
+ *   left. This is the case the whole blast-before-gravity ordering exists for
+ *   — when gravity ran between the beats instead, the bomb dropped a row out
+ *   from under its own queued detonation and silently never went off.
+ * - Then the fall, and only then the wrapped tile's second 3x3 (`repeats`),
+ *   fired from wherever the candy landed rather than from (4,1).
+ */
+const colorBombBystanderCatch: DebugLayout = {
+    cells: (() => {
+        const grid = checkerboard(8, 8);
+        grid[4] = [0, 0, 1, 0, grid[4][4], grid[4][5], grid[4][6], grid[4][7]];
+        grid[3][2] = 0;
+        return grid;
+    })(),
+    specials: [
+        ['4,1', 'wrapped'],
+        ['5,1', 'color-bomb'],
     ],
 };
 
@@ -373,6 +412,7 @@ export const debugLayouts: Record<string, DebugLayout> = {
     'striped-v-4match': stripedV4Match,
     'striped-bystander': stripedBystanderCatch,
     'wrapped-bystander': wrappedBystanderCatch,
+    'colorbomb-bystander': colorBombBystanderCatch,
     'combo-striped-striped': comboStripedStriped,
     'combo-wrapped-wrapped': comboWrappedWrapped,
     // Same layout as `combo`, under the name the combo test matrix uses.

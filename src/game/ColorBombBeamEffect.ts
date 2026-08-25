@@ -135,7 +135,7 @@ function EnsureColorBombBeamShaderRegistered(): void {
  * this default would elapse, and a beam still hanging in the air three
  * seconds after the candies it hit have already exploded reads as a bug.
  */
-export const LIGHTNING_HOLD_DURATION = 3.7;
+export const LIGHTNING_HOLD_DURATION = 1.5;
 const LIGHTNING_FADE_DURATION = 0.3;
 /**
  * A swept bolt's own lifetime: how long it stays lit after its wave fires and
