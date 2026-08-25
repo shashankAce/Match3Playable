@@ -14,8 +14,8 @@ import { theme } from '../config/theme';
 import { rules } from '../config/rules';
 import { BoardLayout, NodeContainer, CellCenter } from './BoardTypes';
 import { AfterTween, Delay } from './AsyncUtil';
-import { SpawnColorBombBeam, LIGHTNING_HOLD_DURATION } from './ColorBombBeamEffect';
-import { SpawnPlainBurst, SpawnWrappedBurst, SpawnStripedBeam } from './TileClearEffects';
+import { SpawnColorBombBeam, LIGHTNING_HOLD_DURATION, SWEEP_BOLT_LIFETIME } from './ColorBombBeamEffect';
+import { SpawnPlainBurst, SpawnAreaEffect } from './TileClearEffects';
 
 export type { BoardLayout, NodeContainer };
 
@@ -35,6 +35,45 @@ const SPECIAL_SETTLE_DURATION = 0.1;
  * still visible when the pop starts.
  */
 const COLOR_BOMB_POP_DELAY = LIGHTNING_HOLD_DURATION;
+/**
+ * The Color Bomb + striped/wrapped conversion beat (see `_runCascade`). A
+ * combo whose rule is "every candy of that color *turns into* that special,
+ * then they all detonate" is two beats, not one — these split the single
+ * model pass that reports it into: beam travels, candies visibly become
+ * specials, they sit as specials long enough to read, then they go off.
+ */
+const CONVERT_BEAM_ARRIVE_DURATION = 0.28;
+const CONVERT_POP_DURATION = 0.16;
+const CONVERT_SETTLE_DURATION = 0.1;
+const CONVERT_HOLD_DURATION = 0.45;
+/**
+ * Gap between successive detonations of a staggered combo (`cleared[].wave`),
+ * and the ceiling on the total stagger — a Color Bomb that converts thirty
+ * candies must still finish promptly, so late waves compress rather than
+ * dragging the pass out one beat per candy.
+ */
+const DETONATION_STAGGER_DURATION = 0.07;
+const DETONATION_STAGGER_MAX = 0.7;
+/** How fast the swapped special vanishes once a Color Bomb has taken its color — see `ResolveResult.consumed`. */
+const CONSUMED_POP_DURATION = 0.12;
+/**
+ * One beat of a `stagedAreas` combo — far longer than a detonation stagger,
+ * because each beat is a whole separate effect (an explosion, then a sweep,
+ * then another sweep) rather than one more tile going off. The giant candy's
+ * hide/show beats below are timed inside it.
+ */
+const COMBO_STAGE_DURATION = 0.34;
+/** How long before a sweep the giant candy ducks out of sight, and how long after it reappears. */
+const COMBO_CANDY_HIDE_LEAD = 0.07;
+const COMBO_CANDY_RETURN_DELAY = 0.16;
+const COMBO_CANDY_FADE_DURATION = 0.09;
+/** How many tiles across the grown candy is drawn — a `radius: 1` band is three tiles wide. */
+const COMBO_CANDY_TILE_SPAN = 3;
+/** A swept beam's lead over the pops it precedes. Its tail is `SWEEP_BOLT_LIFETIME`, so the last wave's bolt dies back as its candies pop rather than hanging over the refilled board. */
+const SWEEP_POP_LEAD_DURATION = 0.12;
+/** Beam hold for a staged conversion pass — it must fade as its targets detonate, not seconds later. */
+const CONVERT_BEAM_HOLD_DURATION =
+    CONVERT_BEAM_ARRIVE_DURATION + CONVERT_POP_DURATION + CONVERT_SETTLE_DURATION + CONVERT_HOLD_DURATION;
 /** Above every other tile's default 0 — so a dragged/swapping tile draws over the neighbors it slides across. */
 const DEFAULT_Z_INDEX = 0;
 const DRAG_TARGET_Z_INDEX = 10;
@@ -427,17 +466,114 @@ export class BoardView {
 
             const spawnedKeys = new Set(result.spawned.map(s => `${s.r},${s.c}`));
             const activatedByKey = new Map(result.activatedSpecials.map(a => [`${a.r},${a.c}`, a]));
-            // A Color Bomb pass holds its candies briefly before popping them,
-            // so the beam/ring effect is seen reaching its targets instead of
-            // the candies vanishing the instant the beam fires — see
-            // `COLOR_BOMB_POP_DELAY`'s doc. Every other pass pops immediately,
-            // same as before.
-            const popDelay = result.colorBombBeam ? COLOR_BOMB_POP_DELAY : 0;
 
+            // A Color Bomb + striped/wrapped swap doesn't merely clear its
+            // targets: the rule is "every candy of that color *turns into*
+            // that special, then they all detonate" — two beats, reported by
+            // the model in a single pass (one `resolve()` is one visual pass,
+            // and splitting the rule across two model passes would let gravity
+            // run in between, which the real game doesn't do). So the view
+            // stages them here: fire the beam, let it reach its targets,
+            // re-frame each converted candy to the special it just became,
+            // hold long enough for a board full of stripes to read as such,
+            // and only then run the detonation below — which is itself
+            // staggered, wave by wave, via `cleared[].wave`. Skipping the beat
+            // is what made the combo look wrong — the candies kept their plain
+            // art and simply vanished while stripe beams fired out of nowhere.
+            const converted = result.colorBombBeam
+                ? result.activatedSpecials.filter(a => a.kind !== 'color-bomb')
+                : [];
+            const staged = converted.length > 0;
             const popPromises: Promise<void>[] = [];
+            /**
+             * Seconds a given `wave` waits before it fires. A `stagedAreas`
+             * combo's beats are whole effects and need room to be read; every
+             * other stagger (a Color Bomb's conversions radiating outward, a
+             * bomb+bomb sweep crossing the columns) is one tile-beat apart and
+             * capped so a large one still finishes promptly.
+             */
+            const stageCount = result.comboBlast?.stages.length ?? 1;
+            const waveTime = (wave: number): number => (stageCount > 1
+                ? wave * COMBO_STAGE_DURATION
+                : Math.min(wave * DETONATION_STAGGER_DURATION, DETONATION_STAGGER_MAX));
+
+            // The swapped special a Color Bomb consumed goes *first*, before
+            // the beam: the swap registers its color and it's gone from its
+            // square, rather than sitting there through the beam and the
+            // conversion only to pop with everything else at the end.
+            const consumedKeys = new Set(result.consumed.map(p => `${p.r},${p.c}`));
+            const consumedPromises: Promise<void>[] = [];
+            for (const p of result.consumed) {
+                const node = this.nodes[p.r][p.c];
+                if (!node) continue;
+                this.nodes[p.r][p.c] = null;
+                // The color it had when it was taken, from `cleared` — the
+                // model has already run gravity, so its board cell now holds
+                // whatever fell into it.
+                const taken = result.cleared.find(cell => cell.r === p.r && cell.c === p.c);
+                if (taken) this._spawnPlainBurst(p.r, p.c, taken.typeId);
+                consumedPromises.push(
+                    AfterTween(
+                        Tween.create(node).to(CONSUMED_POP_DURATION, { scaleX: 0, scaleY: 0, opacity: 0 }, Easing.cubicIn)
+                    ).then(() => {
+                        node.removeFromParent();
+                        this.baseScale.delete(node);
+                    })
+                );
+            }
+
+            // Awaited, not merely started: the candy is gone *before* the
+            // lightning goes out, not fading out underneath it.
+            if (consumedPromises.length) await Promise.all(consumedPromises);
+
+            // A swept beam is timed to the detonation waves it precedes, so it
+            // must hold only as long as the sweep takes; a staged conversion
+            // beam holds for the conversion; everything else uses the default.
+            const maxWave = result.cleared.reduce((m, cell) => Math.max(m, cell.wave), 0);
+            const sweepSpan = Math.min(maxWave * DETONATION_STAGGER_DURATION, DETONATION_STAGGER_MAX);
+            if (result.colorBombBeam) {
+                const hold = staged
+                    ? CONVERT_BEAM_HOLD_DURATION
+                    : result.colorBombBeam.sweep
+                        ? sweepSpan + SWEEP_BOLT_LIFETIME
+                        : undefined;
+                SpawnColorBombBeam(
+                    this.boardRoot, this.layout, result.colorBombBeam,
+                    hold, DETONATION_STAGGER_DURATION
+                );
+            }
+
+            if (staged) {
+                await Delay(CONVERT_BEAM_ARRIVE_DURATION);
+                for (const a of converted) {
+                    const node = this.nodes[a.r][a.c];
+                    if (!node) continue;
+                    const sprite = node.getComponent(Sprite) as Sprite;
+                    // a.typeId, not the board cell — same capture-before-mutation
+                    // rule `spawned` follows; the model has already run gravity.
+                    const base = this.applyFrame(node, sprite, a.typeId, a.kind);
+                    Tween.create(node)
+                        .to(CONVERT_POP_DURATION, { scaleX: base * 1.28, scaleY: base * 1.28 }, Easing.backOut)
+                        .to(CONVERT_SETTLE_DURATION, { scaleX: base, scaleY: base }, Easing.quadOut)
+                        .start();
+                }
+                await Delay(CONVERT_POP_DURATION + CONVERT_SETTLE_DURATION + CONVERT_HOLD_DURATION);
+            }
+
+            // A Color Bomb pass with nothing to convert (a plain-candy target)
+            // still holds its candies while the beam reaches them — see
+            // `COLOR_BOMB_POP_DELAY`'s doc. A staged pass has already spent
+            // that time on the conversion beat above, so it pops immediately,
+            // as does every non-beam pass.
+            const popDelay = !result.colorBombBeam || staged
+                ? 0
+                : result.colorBombBeam.sweep
+                    ? SWEEP_POP_LEAD_DURATION
+                    : COLOR_BOMB_POP_DELAY;
+
             for (const cell of result.cleared) {
                 const key = `${cell.r},${cell.c}`;
-                if (spawnedKeys.has(key)) continue;
+                if (spawnedKeys.has(key) || consumedKeys.has(key)) continue;
 
                 // Fire-and-forget visual flourish — never awaited, so it never
                 // affects cascade pacing. A cleared cell that was a detonating
@@ -448,14 +584,20 @@ export class BoardView {
                 // the bomb's own cell holds the colorless sentinel id, so
                 // `_spawnPlainBurst` finds no color and skips — the beam
                 // effect already playing from that exact cell is its flourish.
+                // A staggered combo detonates in sequence — the model assigns
+                // each cell the beat that claimed it, so the effect and the
+                // pop for that cell both wait for it.
+                const waveDelay = waveTime(cell.wave);
                 const activated = activatedByKey.get(key);
-                if (activated?.kind === 'striped-h' || activated?.kind === 'striped-v') {
-                    this._spawnStripedBeam(activated.r, activated.c, activated.typeId, activated.kind === 'striped-h' ? 'h' : 'v');
-                } else if (activated?.kind === 'wrapped') {
-                    this._spawnWrappedBurst(activated.r, activated.c, activated.typeId);
-                } else if (!activated || activated.kind === 'color-bomb') {
-                    this._spawnPlainBurst(cell.r, cell.c, cell.typeId);
-                }
+                const spawnEffect = (): void => {
+                    if (activated && activated.kind !== 'color-bomb') {
+                        this._spawnActivationEffect(activated.r, activated.c, activated.kind, activated.typeId);
+                    } else {
+                        this._spawnPlainBurst(cell.r, cell.c, cell.typeId);
+                    }
+                };
+                if (waveDelay > 0) void Delay(waveDelay).then(spawnEffect);
+                else spawnEffect();
 
                 const node = this.nodes[cell.r][cell.c];
                 if (!node) continue;
@@ -464,7 +606,7 @@ export class BoardView {
                 popPromises.push(
                     AfterTween(
                         Tween.create(node)
-                            .delay(popDelay)
+                            .delay(popDelay + waveDelay)
                             .to(POP_UP_DURATION, { scaleX: base * 1.15, scaleY: base * 1.15 }, Easing.backOut)
                             .to(POP_DOWN_DURATION, { scaleX: 0, scaleY: 0, opacity: 0 }, Easing.cubicIn)
                     ).then(() => {
@@ -474,8 +616,25 @@ export class BoardView {
                 );
             }
 
-            if (result.colorBombBeam) {
-                SpawnColorBombBeam(this.boardRoot, this.layout, result.colorBombBeam);
+            // A combo that asked to be drawn as one blast (`presentAsBlast`)
+            // reports the shape it actually cleared, so the cross / 5x5 /
+            // 3-wide cross is drawn as itself rather than as whichever two
+            // specials happened to be swapped into each other.
+            if (result.comboBlast) {
+                const blast = result.comboBlast;
+                const color = this._effectColorFor(blast.typeId);
+                for (const stage of blast.stages) {
+                    const at = waveTime(stage.wave);
+                    const draw = (): void => SpawnAreaEffect(
+                        this.boardRoot, this.layout, this.board.rows, this.board.cols,
+                        blast.r, blast.c, stage.area, color
+                    );
+                    if (at > 0) void Delay(at).then(draw);
+                    else draw();
+                }
+                if (blast.stages.length > 1 && blast.kind) {
+                    this._playComboCandy(blast.r, blast.c, blast.typeId, blast.kind, blast.stages.map(st => waveTime(st.wave)));
+                }
             }
 
             for (const s of result.spawned) {
@@ -542,18 +701,71 @@ export class BoardView {
         SpawnPlainBurst(this.boardRoot, this.cellCenter(r, c), type.effectColor);
     }
 
-    /** A bright flash spanning the *entire* row or column the stripe clears — see `TileClearEffects.SpawnStripedBeam`'s doc. */
-    private _spawnStripedBeam(r: number, c: number, typeId: number, orientation: 'h' | 'v'): void {
-        const type = theme.tileTypes[typeId];
-        if (!type) return;
-        SpawnStripedBeam(this.boardRoot, this.layout, this.board.rows, this.board.cols, r, c, type.effectColor, orientation);
+    /**
+     * Draws one activating special's effect as the *shape it clears*, read
+     * from the same `rules.activation[kind].area` the model used to decide
+     * which cells go — never from a per-kind branch here. A retuned rule (a
+     * bigger wrapped radius, a stripe that clears a cross) therefore changes
+     * the visual and the clear together, with no second place to update.
+     */
+    private _spawnActivationEffect(r: number, c: number, kind: SpecialKind, typeId: number): void {
+        SpawnAreaEffect(
+            this.boardRoot, this.layout, this.board.rows, this.board.cols,
+            r, c, rules.activation[kind].area, this._effectColorFor(typeId)
+        );
     }
 
-    /** A bigger radial burst for a wrapped tile's area detonation. */
-    private _spawnWrappedBurst(r: number, c: number, typeId: number): void {
-        const type = theme.tileTypes[typeId];
-        if (!type) return;
-        SpawnWrappedBurst(this.boardRoot, this.cellCenter(r, c), type.effectColor);
+    /**
+     * The combo candy of a `stagedAreas` combo: the striped half, grown to
+     * span the band it's about to clear, standing in for both swapped tiles
+     * once they've popped.
+     *
+     * It doesn't just sit there through the sequence — it *takes* each sweep.
+     * `stageTimes[0]` is the wrapped half's explosion, after which it appears;
+     * then before every later stage it ducks out of sight, the sweep for that
+     * stage plays, and it returns — except after the last one, which it never
+     * comes back from. That hide/return is what sells the sweeps as the candy
+     * itself firing rather than as unrelated beams crossing its square.
+     */
+    private _playComboCandy(r: number, c: number, typeId: number, kind: SpecialKind, stageTimes: number[]): void {
+        const { x, y } = this.cellCenter(r, c);
+        const node = new Node(x, y);
+        const sprite = node.addComponent(Sprite);
+        const base = this.applyFrame(node, sprite, typeId, kind);
+        const grown = base * COMBO_CANDY_TILE_SPAN;
+        node.scaleX = 0;
+        node.scaleY = 0;
+        this.boardRoot.addChild(node);
+        node.zIndex = DRAG_ACTIVE_Z_INDEX; // over the tiles it's about to clear
+
+        const appearAt = stageTimes[0] + COMBO_CANDY_RETURN_DELAY;
+        const tween = Tween.create(node)
+            .delay(appearAt)
+            .to(COMBO_CANDY_FADE_DURATION, { scaleX: grown, scaleY: grown, opacity: 1 }, Easing.backOut);
+
+        let cursor = appearAt + COMBO_CANDY_FADE_DURATION;
+        stageTimes.slice(1).forEach((sweepAt, i) => {
+            const last = i === stageTimes.length - 2;
+            const hideAt = sweepAt - COMBO_CANDY_HIDE_LEAD;
+            tween.delay(Math.max(0.001, hideAt - cursor))
+                .to(COMBO_CANDY_FADE_DURATION, { opacity: 0 }, Easing.cubicIn);
+            cursor = hideAt + COMBO_CANDY_FADE_DURATION;
+            if (last) return; // hidden before the final sweep, and gone for good
+            const backAt = sweepAt + COMBO_CANDY_RETURN_DELAY;
+            tween.delay(Math.max(0.001, backAt - cursor))
+                .to(COMBO_CANDY_FADE_DURATION, { opacity: 1 }, Easing.quadOut);
+            cursor = backAt + COMBO_CANDY_FADE_DURATION;
+        });
+
+        AfterTween(tween).then(() => {
+            node.removeFromParent();
+            this.baseScale.delete(node);
+        });
+    }
+
+    /** A tile type's own effect tint, falling back to the colorless one for a Color Bomb's sentinel id (`theme.colorBombEffectColor`). */
+    private _effectColorFor(typeId: number): string {
+        return theme.tileTypes[typeId]?.effectColor ?? theme.colorBombEffectColor;
     }
 
     private _checkGameOver(): void {

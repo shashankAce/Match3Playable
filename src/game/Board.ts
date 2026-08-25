@@ -51,6 +51,8 @@ interface ActivatedSpecial {
     c: number;
     kind: SpecialKind;
     typeId: number;
+    /** Which beat of a staggered detonation this belongs to — see `ResolveResult.cleared`'s `wave`. `0` for everything that goes off at once. */
+    wave: number;
 }
 
 /**
@@ -86,7 +88,20 @@ export interface ResolveResult {
      * already follows, since callers (collect-mode target tracking) need to
      * know what color/type each cleared cell actually was.
      */
-    cleared: { r: number; c: number; typeId: number }[];
+    cleared: {
+        r: number;
+        c: number;
+        typeId: number;
+        /**
+         * Which beat of a staggered detonation cleared this cell. A Color
+         * Bomb combo converts a whole color and the converted candies then go
+         * off *in sequence*, radiating out from the bomb, rather than in one
+         * instant — so each detonation gets a wave index and every cell it
+         * claims inherits it (the lowest, if two claim the same cell). `0`
+         * everywhere else, which is every cell clearing at once.
+         */
+        wave: number;
+    }[];
     /**
      * Newly created special tiles this pass, placed at their spawn cell (not
      * cleared). `typeId` is captured at spawn time, not meant to be re-read
@@ -110,7 +125,48 @@ export interface ResolveResult {
      * color) — lets a renderer draw a "lightning" from the bomb to every cell
      * of that color.
      */
-    colorBombBeam: { originR: number; originC: number; targetTypeId: number; cells: CellPos[] } | null;
+    colorBombBeam: {
+        /** Every cell a bolt fires *from* — one per Color Bomb involved (`ComboRule.beamFromBothSides` makes it two). */
+        origins: CellPos[];
+        /** The color being hunted, or the colorless sentinel for a combo with no single target color. */
+        targetTypeId: number;
+        /** `true` = the renderer should time each bolt to its target's `wave` rather than firing them all at once. */
+        sweep: boolean;
+        /** Every cell a bolt reaches, with the detonation beat it belongs to (see `cleared`'s `wave`). */
+        cells: { r: number; c: number; wave: number }[];
+    } | null;
+    /**
+     * Cells whose tile was *consumed* by a combo rather than detonated — the
+     * special swapped into a Color Bomb (`ComboRule.partnerConsumed`). They're
+     * in `cleared` like any other cell, but listed separately because they
+     * come off the board on a different beat: the swap registers their color
+     * and they vanish immediately, *before* the bomb's beam goes out, rather
+     * than waiting for the detonation everything else is timed to.
+     */
+    consumed: CellPos[];
+    /**
+     * A combo's own blast, when its rule asked to be presented as one shape
+     * (`presentAsBlast`) rather than as its two participants' individual
+     * activations — the cleared `area`, where it's centred, and the color to
+     * draw it in. Lets a renderer draw the cross / 5x5 / 3-wide cross that's
+     * actually clearing, instead of inferring it from whichever two specials
+     * happened to be swapped. `typeId` may be the colorless sentinel (a Color
+     * Bomb + Color Bomb whole-board clear has no tile color of its own).
+     */
+    comboBlast: {
+        r: number;
+        c: number;
+        typeId: number;
+        /** The participant kind whose art stands for this combo (the striped half of a Striped + Wrapped), or `null` if neither side has one to show. */
+        kind: SpecialKind | null;
+        /**
+         * The shapes this combo clears, in order. One entry for an ordinary
+         * combo; a `stagedAreas` rule gives one per beat, each with the `wave`
+         * its cells were stamped with, so a renderer can draw them in the same
+         * sequence the board clears in.
+         */
+        stages: { area: AreaSpec; wave: number }[];
+    } | null;
     /** Score awarded for this pass alone (before any further cascade passes), including `rules.scoring`'s cascade multiplier and special-creation bonuses. */
     scoreDelta: number;
     /** Gravity/refill result, one entry per moved-or-spawned cell, empty if `cleared` was empty. */
@@ -357,7 +413,7 @@ export class Board {
 
         const runs = this._findRuns();
         if (runs.length === 0 && forcedClear.size === 0) {
-            return { cleared: [], spawned: [], activatedSpecials: [], colorBombBeam: null, scoreDelta: 0, moves: [] };
+            return { cleared: [], spawned: [], activatedSpecials: [], colorBombBeam: null, comboBlast: null, consumed: [], scoreDelta: 0, moves: [] };
         }
 
         const toClear = forcedClear;
@@ -525,12 +581,15 @@ export class Board {
         toClear: Set<string>,
         activatedSpecials: ActivatedSpecial[],
         colorBombBeam: ResolveResult['colorBombBeam'],
-        spawned: { r: number; c: number; special: SpecialKind; typeId: number }[] = []
+        spawned: { r: number; c: number; special: SpecialKind; typeId: number }[] = [],
+        comboBlast: ResolveResult['comboBlast'] = null,
+        waves: Map<string, number> = new Map(),
+        consumed: CellPos[] = []
     ): ResolveResult {
-        const cleared: { r: number; c: number; typeId: number }[] = [];
+        const cleared: ResolveResult['cleared'] = [];
         for (const k of toClear) {
             const [r, c] = Board.parseKey(k);
-            cleared.push({ r, c, typeId: this.cells[r][c] });
+            cleared.push({ r, c, typeId: this.cells[r][c], wave: waves.get(k) ?? 0 });
             this.cells[r][c] = -1;
             this.specials.delete(k);
         }
@@ -539,7 +598,7 @@ export class Board {
 
         const moves = this._collapseAndRefill();
 
-        return { cleared, spawned: survivingSpawned, activatedSpecials, colorBombBeam, scoreDelta, moves };
+        return { cleared, spawned: survivingSpawned, activatedSpecials, colorBombBeam, comboBlast, consumed, scoreDelta, moves };
     }
 
     /**
@@ -583,7 +642,7 @@ export class Board {
                 for (const cell of this._areaCells(action.area, action.r, action.c)) {
                     toClear.add(Board.key(cell.r, cell.c));
                 }
-                activated.push({ r: action.r, c: action.c, kind: action.reportAs, typeId: this.cells[action.r][action.c] });
+                activated.push({ r: action.r, c: action.c, kind: action.reportAs, typeId: this.cells[action.r][action.c], wave: 0 });
             } else if (action.kind === 'activate') {
                 const key = Board.key(action.r, action.c);
                 const kind = this.specials.get(key);
@@ -591,7 +650,7 @@ export class Board {
                 if (!kind || !rules.activation[kind].chainsWhenCaught) continue;
                 toClear.add(key);
                 seen.add(key);
-                activated.push({ r: action.r, c: action.c, kind, typeId: this.cells[action.r][action.c] });
+                activated.push({ r: action.r, c: action.c, kind, typeId: this.cells[action.r][action.c], wave: 0 });
                 this._expandCaught(kind, action.r, action.c, toClear, seen, deferred);
             } else {
                 const candidates: number[] = [];
@@ -623,14 +682,46 @@ export class Board {
         c: number,
         typeId: number,
         toClear: Set<string>,
-        activated: ActivatedSpecial[]
+        activated: ActivatedSpecial[],
+        wave = 0,
+        waves?: Map<string, number>
     ): void {
         const activation = rules.activation[kind];
         for (const cell of this._areaCells(activation.area, r, c, typeId)) {
-            toClear.add(Board.key(cell.r, cell.c));
+            const key = Board.key(cell.r, cell.c);
+            toClear.add(key);
+            // Lowest wins: a cell in two detonations' paths belongs to
+            // whichever goes off first, so it can't pop twice or pop late.
+            if (waves && wave < (waves.get(key) ?? Infinity)) waves.set(key, wave);
         }
-        activated.push({ r, c, kind, typeId });
+        activated.push({ r, c, kind, typeId, wave });
         this._queueRepeats(kind, r, c);
+    }
+
+    /** Swaps a band's axis — see `ComboRule.orientToPartner`. Anything that isn't a band is returned untouched. */
+    private static _flipBand(area: AreaSpec): AreaSpec {
+        if (area.shape === 'row-band') return { shape: 'column-band', radius: area.radius };
+        if (area.shape === 'column-band') return { shape: 'row-band', radius: area.radius };
+        return area;
+    }
+
+    /** Chebyshev-ish ordering key: how far a cell is from the combo's origin, for radiating a staggered detonation outward. */
+    private static _distanceTo(origin: { r: number; c: number }, cell: CellPos): number {
+        return Math.hypot(cell.r - origin.r, cell.c - origin.c);
+    }
+
+    /**
+     * Which special a `spreadPartnerActivation` cell actually turns into.
+     * Only interesting for a striped partner: real Candy Crush gives each
+     * converted candy its own orientation (the board ends up crosshatched
+     * with row and column clears), so `'random'` coin-flips per cell;
+     * `'partner'`/unset copies the swapped tile's own direction for all of
+     * them. Anything non-striped is itself either way.
+     */
+    private _spreadKind(partner: SpecialKind, orientation: 'partner' | 'random' | undefined): SpecialKind {
+        if (orientation !== 'random') return partner;
+        if (partner !== 'striped-h' && partner !== 'striped-v') return partner;
+        return Math.random() < 0.5 ? 'striped-h' : 'striped-v';
     }
 
     /** Queues a special's `repeats` re-detonations at (r,c) for the next phase — the always-double-explodes rule, as data. */
@@ -670,7 +761,12 @@ export class Board {
         const k2 = this.getSpecialAt(r2, c2);
         const toClear = new Set<string>([Board.key(r1, c1), Board.key(r2, c2)]);
         const activated: ActivatedSpecial[] = [];
+        /** Per-cell detonation beat, for a combo that goes off in sequence rather than all at once — see `ResolveResult.cleared`'s `wave`. */
+        const waves = new Map<string, number>();
+        /** The swapped special a `partnerConsumed` rule takes off the board up front — see `ResolveResult.consumed`. */
+        const consumed: CellPos[] = [];
         let colorBombBeam: ResolveResult['colorBombBeam'] = null;
+        let comboBlast: ResolveResult['comboBlast'] = null;
 
         const combo = FindComboRule(k1, k2);
         if (combo) {
@@ -682,15 +778,66 @@ export class Board {
             const targetTypeId = this.cells[b.r][b.c];
             const rule = combo.rule;
 
-            if (a.kind) activated.push({ r: a.r, c: a.c, kind: a.kind, typeId: this.cells[a.r][a.c] });
-            if (b.kind) activated.push({ r: b.r, c: b.c, kind: b.kind, typeId: targetTypeId });
-
-            /** The `'same-color'` cells this combo picked out — what the beam draws to, and what `spreadPartnerActivation` detonates. */
+            /** The `'same-color'` cells this combo picked out — what `spreadPartnerActivation` detonates. */
             const colorTargets: CellPos[] = [];
-            for (const area of rule.areas) {
+            /** Every cell any of this combo's areas reached, deduped — what a `beam` draws to. */
+            const beamTargets: CellPos[] = [];
+            const seenTarget = new Set<string>();
+            // Stated for a horizontal stripe; a vertical one sweeps the other
+            // way round, so the combo always runs along the stripe first.
+            const flipBands = rule.orientToPartner && (a.kind === 'striped-v' || b.kind === 'striped-v');
+            const areas = flipBands ? rule.areas.map(Board._flipBand) : rule.areas;
+            areas.forEach((area, stage) => {
                 const cells = this._areaCells(area, a.r, a.c, targetTypeId);
-                for (const cell of cells) toClear.add(Board.key(cell.r, cell.c));
+                // `stagedAreas`: each entry is its own beat, and a cell belongs
+                // to the first beat that claims it (so the 3x3 at the centre
+                // goes with the explosion, not with the sweep that crosses it).
+                const wave = rule.stagedAreas ? stage : 0;
+                for (const cell of cells) {
+                    const key = Board.key(cell.r, cell.c);
+                    toClear.add(key);
+                    if (wave < (waves.get(key) ?? Infinity)) waves.set(key, wave);
+                    if (seenTarget.has(key)) continue;
+                    seenTarget.add(key);
+                    beamTargets.push(cell);
+                }
                 if (area.shape === 'same-color') colorTargets.push(...cells);
+            });
+
+            // A `presentAsBlast` combo reports one blast of its own shape
+            // instead of its two participants' individual activations —
+            // otherwise a renderer would draw, say, two horizontal stripe
+            // beams for a swap that's actually clearing a full cross.
+            if (rule.presentAsBlast) {
+                const aTypeId = this.cells[a.r][a.c];
+                comboBlast = {
+                    r: a.r,
+                    c: a.c,
+                    // The blast takes its color from whichever participant has
+                    // one; both being colorless (bomb + bomb) leaves the
+                    // sentinel, which a renderer treats as "no tile color".
+                    typeId: aTypeId === COLORLESS_TYPE_ID ? targetTypeId : aTypeId,
+                    kind: a.kind ?? b.kind,
+                    stages: areas.map((area, stage) => ({ area, wave: rule.stagedAreas ? stage : 0 })),
+                };
+            } else {
+                if (a.kind) activated.push({ r: a.r, c: a.c, kind: a.kind, typeId: this.cells[a.r][a.c], wave: 0 });
+                // A consumed partner hands over its color and vanishes — it
+                // never detonates, so it's never reported as one; it's
+                // reported as consumed instead, so the renderer takes it off
+                // the board before the beam rather than with the blast.
+                if (b.kind && rule.partnerConsumed) consumed.push({ r: b.r, c: b.c });
+                else if (b.kind) activated.push({ r: b.r, c: b.c, kind: b.kind, typeId: targetTypeId, wave: 0 });
+            }
+
+
+            // A swept combo detonates along an axis instead of all at once —
+            // the wave index *is* the column (or row), so the front crosses the
+            // board in one pass and every cell in a line goes together.
+            if (rule.sweep) {
+                for (const cell of beamTargets) {
+                    waves.set(Board.key(cell.r, cell.c), rule.sweep.axis === 'column' ? cell.c : cell.r);
+                }
             }
 
             // "Turns every candy of that color into a <partner special> and
@@ -698,20 +845,45 @@ export class Board {
             // queues the partner's own repeats, so a wrapped partner still
             // double-explodes everywhere it landed.
             if (rule.spreadPartnerActivation && b.kind) {
-                for (const cell of colorTargets) {
-                    if (cell.r === b.r && cell.c === b.c) continue; // already reported as `b` itself
-                    this._detonateAt(b.kind, cell.r, cell.c, targetTypeId, toClear, activated);
+                const spread = rule.spreadPartnerActivation;
+                // The bomb converts the *normal* candies of that color; the
+                // partner itself is either consumed (nothing to convert — it's
+                // already a special) or detonates in place, per the rule.
+                const converts = colorTargets.filter(cell => !(cell.r === b.r && cell.c === b.c));
+                // Ordered by distance from the bomb, and detonated in that
+                // order, so the wave radiates outward from where the lightning
+                // came from instead of sweeping in arbitrary grid-scan order.
+                converts.sort((p, q) => Board._distanceTo(a, p) - Board._distanceTo(a, q));
+                converts.forEach((cell, i) => {
+                    this._detonateAt(
+                        this._spreadKind(b.kind!, spread.stripeOrientation),
+                        cell.r, cell.c, targetTypeId, toClear, activated, i + 1, waves
+                    );
+                });
+                if (!rule.partnerConsumed) {
+                    // Not consumed: the partner fires its own area from its own
+                    // cell, keeping its own orientation, and owes its repeats.
+                    for (const cell of this._areaCells(rules.activation[b.kind].area, b.r, b.c, targetTypeId)) {
+                        toClear.add(Board.key(cell.r, cell.c));
+                    }
+                    this._queueRepeats(b.kind, b.r, b.c);
                 }
-                // `b`'s own cell detonates too, but its `activated` entry is
-                // already pushed above — only its area and repeats are owed.
-                for (const cell of this._areaCells(rules.activation[b.kind].area, b.r, b.c, targetTypeId)) {
-                    toClear.add(Board.key(cell.r, cell.c));
-                }
-                this._queueRepeats(b.kind, b.r, b.c);
             }
 
             if (rule.beam) {
-                colorBombBeam = { originR: a.r, originC: a.c, targetTypeId, cells: colorTargets };
+                const origins: CellPos[] = rule.beamFromBothSides
+                    ? [{ r: a.r, c: a.c }, { r: b.r, c: b.c }]
+                    : [{ r: a.r, c: a.c }];
+                colorBombBeam = {
+                    origins,
+                    targetTypeId,
+                    sweep: !!rule.sweep,
+                    cells: beamTargets
+                        // A bolt from a bomb to itself is a zero-length quad —
+                        // the origins are cleared, just never shot at.
+                        .filter(cell => !origins.some(o => o.r === cell.r && o.c === cell.c))
+                        .map(cell => ({ r: cell.r, c: cell.c, wave: waves.get(Board.key(cell.r, cell.c)) ?? 0 })),
+                };
             }
             if (rule.repeat) {
                 this._pending.push({ kind: 'burst', r: a.r, c: a.c, area: rule.repeat.area, reportAs: rule.repeat.as });
@@ -735,7 +907,7 @@ export class Board {
         // next phase.
         activated.push(...this._catchBystanders(toClear));
 
-        return this._finalizeClear(toClear, activated, colorBombBeam);
+        return this._finalizeClear(toClear, activated, colorBombBeam, [], comboBlast, waves, consumed);
     }
 
     /**
@@ -805,7 +977,7 @@ export class Board {
             if (!kind || !rules.activation[kind].chainsWhenCaught || seen.has(k)) continue;
             seen.add(k);
             const [r, c] = Board.parseKey(k);
-            activated.push({ r, c, kind, typeId: this.cells[r][c] });
+            activated.push({ r, c, kind, typeId: this.cells[r][c], wave: 0 });
             this._expandCaught(kind, r, c, toClear, seen, deferred);
         }
         return activated;
@@ -874,10 +1046,17 @@ export class Board {
                 }
                 return cells;
             case 'band-cross':
+                return [
+                    ...this._areaCells({ shape: 'row-band', radius: spec.radius }, r, c),
+                    ...this._areaCells({ shape: 'column-band', radius: spec.radius }, r, c),
+                ];
+            case 'row-band':
                 for (let rr = r - spec.radius; rr <= r + spec.radius; rr++) {
                     if (!this.inBounds(rr, c)) continue;
                     for (let cc = 0; cc < this.cols; cc++) cells.push({ r: rr, c: cc });
                 }
+                return cells;
+            case 'column-band':
                 for (let cc = c - spec.radius; cc <= c + spec.radius; cc++) {
                     if (!this.inBounds(r, cc)) continue;
                     for (let rr = 0; rr < this.rows; rr++) cells.push({ r: rr, c: cc });

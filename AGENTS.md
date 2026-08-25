@@ -100,7 +100,11 @@ reskin might want the same *rules* with new art, or the same art with new
   shared/tinted fallback to lean on if a new theme's art pack is missing one.
   One exception: `theme.colorBombSpriteKey` is a single top-level frame, not
   per-type — a Color Bomb represents no one color, so it doesn't belong in
-  `TileTypeConfig` at all.
+  `TileTypeConfig` at all. `theme.colorBombEffectColor` is its effect-tint
+  counterpart, used by the beam/rings and by any blast centred on a colorless
+  tile (the whole-board flash of a Color Bomb + Color Bomb swap) — it exists
+  so `src/game/` never needs a literal color of its own for the one case
+  `tileTypes[].effectColor` can't answer.
 - **Special spawn location**: `Board.resolve(preferredCells?)` spawns a
   striped tile at a swap's destination cell when that cell is part of the
   qualifying run, falling back to the run's middle only for cascade-triggered
@@ -248,6 +252,123 @@ skipped:
   guide, Unity Ads' playable end-card docs) that every major network's own
   host container draws that control, not the creative; this doc previously
   only had that confirmed for AppLovin/Unity's MRAID path specifically.
+- **Striped + Wrapped choreographed as three beats (2026-08-25)** — the
+  combo cleared the right 39 cells but presented them as one flat blast. It
+  now plays the way the real game does: the wrapped half's **3x3** goes off,
+  the striped half **grows to three tiles** and sweeps **along its own stripe
+  direction**, then sweeps **across** it. Same cells, sequenced. Three pieces:
+    - `ComboRule.stagedAreas` turns `areas` from a set into a *sequence* — each
+      entry is its own beat, and a cell belongs to the first beat that claims
+      it (so the centre 3x3 goes with the explosion, not with the sweep that
+      crosses it). `AreaSpec` gained `'row-band'`/`'column-band'`, the two
+      halves of the existing `'band-cross'`, so the sweeps can be named
+      separately; `band-cross` now delegates to them in both the model and the
+      renderer.
+    - `ComboRule.orientToPartner` states the bands for a *horizontal* stripe
+      and swaps them when the striped participant is vertical, so the combo
+      always runs along the stripe first. Verified both orientations:
+      `box>row-band>column-band` for `striped-h`, `box>column-band>row-band`
+      for `striped-v`, 39 cells either way.
+    - `ResolveResult.comboBlast` now carries `stages: {area, wave}[]` (was one
+      `area`) plus the `kind` whose art stands for the combo, and
+      `BoardView._playComboCandy` draws that giant candy: it appears after the
+      3x3, **ducks out of sight for each sweep and returns between them**, and
+      after the final sweep never comes back. That hide/return is what sells
+      the sweeps as the candy itself firing rather than beams crossing its
+      square. A staged pass also uses its own, much longer wave step
+      (`COMBO_STAGE_DURATION`) than a tile-by-tile stagger — each beat is a
+      whole effect and needs room to read.
+  Verified frame by frame in Playwright: 3x3 + grown candy at 400ms, three row
+  trails swept and the candy back between beats at 560ms, column sweep running
+  with the candy gone for good at 700ms.
+- **Swept beam reads as a front, and the Wrapped+Bomb second wave settled
+  (2026-08-25)** — two follow-ups from watching the combos play. (1) A swept
+  bolt now dies back on its own `SWEEP_BOLT_LIFETIME` after its wave fires,
+  rather than staying lit for the whole beam. Accumulating every wave's bolts
+  had two costs: the sense of travel was lost (by the last column the fan
+  covered the entire board, so nothing read as moving), and the beam was
+  still drawn over candies that had already cleared *and refilled* behind it
+  — confirmed on screen at 820ms into a bomb+bomb swap, where a full fan sat
+  on top of a freshly refilled board. Sizing the beam's `holdDuration` from
+  the same lifetime makes the last wave fade as its own candies pop.
+  (2) Wrapped + Color Bomb's second wave is the converted candies' double
+  explosion, not a second random color — see that combo's bullet below.
+- **Color Bomb combos re-sequenced to match the real game (2026-08-25)** —
+  what a bomb combo *looks like*, beat by beat, corrected against how the real
+  game plays it. Three changes, all expressed as rule data rather than
+  branches in the model:
+    - `ComboRule.partnerConsumed` (set on `bomb+striped` and `bomb+wrapped`):
+      the swapped special is **consumed, not detonated**. It hands over its
+      color and vanishes from its square — no area of its own, no `repeats`,
+      no conversion. Previously it also fired a bonus row/3x3 from wherever it
+      landed, which is not what happens: what you see is the *converted*
+      candies going off. It's reported as `ResolveResult.consumed`, separate
+      from `cleared`, because it leaves on a different beat — `BoardView`
+      pops it and **awaits** that before the beam is spawned, so the candy is
+      gone before the lightning goes out rather than fading underneath it.
+    - `ResolveResult.cleared[].wave` — a per-cell detonation beat. Converted
+      candies detonate **in sequence, radiating outward** from the bomb
+      (ordered by distance), and every cell a detonation claims inherits its
+      wave (lowest wins). The view delays that cell's effect and its pop by
+      `wave x 0.07s`, capped at 0.7s total so a thirty-candy conversion still
+      finishes promptly.
+    - `ComboRule.sweep` + `beamFromBothSides`, on `bomb+bomb`: two Color Bombs
+      now fire beams from **both** cells and the board clears **column by
+      column, col 0 to col 7** — the wave index *is* the column. It used to be
+      one flat whole-board flash with no beam at all (`presentAsBlast` is gone
+      from that rule; the beams and the sweep are its presentation now).
+      `colorBombBeam` accordingly carries `origins: CellPos[]` (was a single
+      `originR`/`originC`), a `sweep` flag, and a `wave` per target cell;
+      `SpawnColorBombBeam` takes a `sweepStep` and reveals each bolt and ring
+      on its own beat, and a `holdDuration` sized to the sweep so the beam
+      fades with the last wave instead of hanging around for the default 3.7s.
+  Verified with the standalone `Board`-model method (the consumed partner
+  firing nothing, wave-equals-column across all 64 cells, both beam origins,
+  62 bolt targets) and a Playwright pass: at 300ms into a bomb+bomb swap the
+  front has reached column 3 with columns 4-7 untouched, which is the sweep.
+- **Combo rules completed and every blast drawn as its own shape
+  (2026-08-25)** — the rule tables made two long-standing mismatches easy to
+  see and fix: Striped + Wrapped no longer double-explodes (see its bullet
+  below), and Color Bomb + Striped now gives each converted candy its own
+  random orientation. The bigger change is presentational. The renderer used
+  to infer an effect from *which specials went off*, so a combo could only
+  ever be drawn as its two participants — a Striped + Striped cross showed
+  whatever two stripe directions happened to be swapped (often neither of the
+  lines actually clearing), a 5x5 looked exactly like a 3x3, and a whole-board
+  clear had no effect at all. Three pieces fix that:
+    - `ComboRule.presentAsBlast` makes a combo report `ResolveResult.comboBlast`
+      — its own cleared `AreaSpec`, centre and color — *instead of* its
+      participants' individual activations.
+    - `TileClearEffects.SpawnAreaEffect(…, area, color)` draws any `AreaSpec`,
+      and `BoardView` feeds it the same `rules.activation[kind].area` the model
+      cleared with. Effect and clear now come from one number: retune a
+      wrapped radius and both follow, with no second place to update.
+    - A striped activation is now two halves flying to opposite edges, each
+      with a trail and a brighter head (`SpawnStripeSplit`), instead of the
+      whole line flashing at once — closer to the real game's read, and built
+      from plain `ColorRect`s tinted with the candy's own `effectColor`, since
+      this art pack has no beam sprites.
+  A box blast draws the rect that actually clears, clipped to the board the
+  same way `_areaCells` clips it, so a 3x3 in a corner shows its 4 real cells
+  and a 5x5 is visibly five wide. Color Bomb + striped/wrapped additionally
+  got its missing **conversion beat**: the rule is "every candy of that color
+  *turns into* that special, then they all detonate", which is two beats
+  reported in one model pass (splitting it across two `resolve()` calls would
+  let gravity run in between, which the real game doesn't do), so
+  `_runCascade` stages it in the view — beam travels, each caught candy is
+  re-framed to the special it became and pops, the board sits full of
+  stripes/wrapped candies for a beat, and only then do they go off.
+  `SpawnColorBombBeam` takes an optional shorter `holdDuration` for that path
+  so the beam fades as its targets detonate instead of hanging in the air
+  afterwards. Without the beat the conversion was invisible: the candies kept
+  their plain art and simply vanished while beams fired out of nowhere. `debugLayouts.ts` opens with a **combo test
+  matrix** — one `?layout=` row per combo rule, with the swap to make and what
+  to expect from both the clear and the effect; `combo-striped-striped`,
+  `combo-wrapped-wrapped`, `combo-striped-wrapped` and `wrapped-bystander`
+  were added to cover the rows that had no scene. Verified with the
+  standalone `Board`-model method (the combo-blast shapes, the removed
+  repeat, orientation spread across repeated runs) plus a Playwright pass
+  screenshotting each scene mid-blast.
 - **Rules turned into data, and the Color-Bomb-swap position bug fixed
   (2026-08-25)** — two changes, one cause. `Board.activateSpecialSwap()` used
   to run a combo against *pre-swap* coordinates (`BoardView` deliberately
@@ -415,9 +536,12 @@ game's, not claimed to be pixel-exact except where noted):
   (`r1,c1`) — 15 cells on an 8-wide/tall board, verified directly against
   `Board`.
 - Striped + Wrapped → the same row+column, but thickened to a `band-cross`
-  of radius 1 (3 full rows + 3 full columns) instead of a single line, and (since this combo involves
-  a wrapped tile) **also double-explodes** the same way Wrapped+Wrapped does
-  below — verified directly.
+  of radius 1 (3 full rows + 3 full columns) instead of a single line, fired
+  **once** — verified directly. It carried a second blast for a while, on the
+  reasoning that "any wrapped detonation double-explodes"; that rule is about
+  a wrapped tile going off *as a wrapped tile*, which this combo doesn't do
+  (candy_crush_rules.md §4 describes it as one giant beam), so the `repeat`
+  was removed 2026-08-25 and the combo now matches the rule book.
 - Wrapped + Wrapped → a bigger area, a `box` of radius 2 instead of the
   lone wrapped tile's radius 1 (25 cells), that **explodes twice**
   — matches candy_crush_rules.md's "5x5 blast area that explodes twice"
@@ -427,20 +551,27 @@ game's, not claimed to be pixel-exact except where noted):
   explosions verified directly.
 - Color Bomb + Striped/Wrapped → every candy of the *other* candy's color is
   cleared, each also triggering that special's own area from its own
-  position (a simplified stand-in for "they all turn into that special and
-  detonate") — verified directly. When the other special is **Wrapped**
-  specifically, this also matches candy_crush_rules.md's fuller description:
-  each of those wrapped detonations double-explodes (queued the same way as
-  a standalone Wrapped+Wrapped), and once that settles, a **second random
-  color** (excluding the first) gets the same full wrapped-and-detonate
-  (and double-explode) treatment — queued as a `'colorSweep'` `PendingAction`.
-  Striped+Color-Bomb has no such second-color step; that's Wrapped+Color-Bomb
-  only, per the rule book.
+  position ("they all turn into that special and detonate") — verified
+  directly. For a **Striped** partner each converted candy gets its *own*
+  random orientation (`rules.combos`' `spreadPartnerActivation.stripeOrientation`),
+  so the board clears in a mix of rows and columns the way the real game does,
+  rather than every one of them copying the swapped tile's direction. When the other special is **Wrapped**
+  specifically, each of those wrapped detonations **double-explodes** (queued
+  the same way as a standalone Wrapped+Wrapped) — and that double explosion
+  *is* the combo's famous "two waves". `candy_crush_rules.md` §4 additionally
+  claims a **second random color** gets the same treatment once the first
+  settles, and that was implemented as a `'colorSweep'` `PendingAction` for a
+  while; it was **removed 2026-08-25** after checking against the live game,
+  which does the double detonation and nothing more. Secondary guides
+  disagree with each other on this one (some describe the combo as two plain
+  color clears with no wrappify at all) and a King Community thread asks
+  whether its effect changed, so the rule book's version is most likely a
+  different era of the game rather than a mistake. The `colorSweepAfter` rule
+  field still exists and still works — no rule uses it.
 - Color Bomb + Color Bomb → clears the entire board — verified directly.
 - Color Bomb + a normal candy → clears every candy of that normal candy's
-  color — verified directly (the exact mechanism, `activateSpecialSwap`'s
-  `s1===color-bomb || s2===color-bomb` branch, scanning `cells` for
-  matching `typeId`).
+  color — verified directly (the exact mechanism: `rules.combos`' `bomb+any`
+  rule, whose `'same-color'` `AreaSpec` scans `cells` for matching `typeId`).
 - **Any wrapped detonation always double-explodes** — not just the
   Wrapped+Wrapped and Wrapped+Color-Bomb combos above, but a lone wrapped
   tile too, whether caught passively in another special's blast, or

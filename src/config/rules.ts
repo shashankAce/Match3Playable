@@ -88,6 +88,10 @@ export type AreaSpec =
     | { shape: 'box'; radius: number }
     /** A thick `+`: every row within `radius` of the centre, and every column within `radius` (`radius: 1` = 3 full rows + 3 full columns). */
     | { shape: 'band-cross'; radius: number }
+    /** Just the horizontal half of a `band-cross`: every row within `radius` of the centre, full width. */
+    | { shape: 'row-band'; radius: number }
+    /** Just the vertical half: every column within `radius` of the centre, full height. */
+    | { shape: 'column-band'; radius: number }
     /** Every cell on the board holding the trigger colour — the Color Bomb's signature effect. Ignores the centre cell. */
     | { shape: 'same-color' }
     /** Literally everything. */
@@ -189,17 +193,73 @@ export interface ComboRule {
      * Bomb first in any rule involving one.
      */
     match: [SpecialSelector, SpecialSelector];
-    /** Cleared immediately, resolved against `a`'s cell and `b`'s colour. */
+    /** Cleared by this combo, resolved against `a`'s cell and `b`'s colour. All at once, unless `stagedAreas` says otherwise. */
     areas: AreaSpec[];
     /**
-     * `true` = every cell `'same-color'` picked out also detonates as if it
-     * were `b`'s own special (Candy Crush's "turns every candy of that colour
-     * into a Striped/Wrapped Candy, then detonates them all"), including
-     * `b`'s own `repeats`. No-op when `b` is a plain candy.
+     * `true` = `areas` is a *sequence*, not a set: each entry is a beat of its
+     * own, cleared (and drawn) after the one before it. Which cells clear is
+     * unchanged — only when. This is what lets Striped + Wrapped read the way
+     * it does in the real game: the 3x3 goes off, then the giant candy sweeps
+     * one axis, then the other, instead of the whole 39-cell cross blinking
+     * out at once.
      */
-    spreadPartnerActivation?: boolean;
-    /** `true` = report a Color-Bomb beam from `a`'s cell to every `'same-color'` cell, for the renderer to draw. */
+    stagedAreas?: boolean;
+    /**
+     * `true` = `'row-band'`/`'column-band'` entries in `areas` are stated for
+     * a *horizontal* stripe and get swapped when the striped participant is
+     * vertical, so the combo always sweeps along the stripe's own direction
+     * first and across it second.
+     */
+    orientToPartner?: boolean;
+    /**
+     * Set = every cell `'same-color'` picked out also detonates as if it were
+     * `b`'s own special (Candy Crush's "turns every candy of that colour into
+     * a Striped/Wrapped Candy, then detonates them all"), including `b`'s own
+     * `repeats`. No-op when `b` is a plain candy.
+     *
+     * `stripeOrientation` only matters when `b` is striped: `'random'` gives
+     * each converted tile its own coin-flip orientation, which is what the
+     * real game does (the board ends up crosshatched with row and column
+     * clears, not all one direction); `'partner'` copies the swapped tile's
+     * own orientation for every one of them.
+     */
+    spreadPartnerActivation?: { stripeOrientation?: 'partner' | 'random' };
+    /**
+     * `true` = the non-bomb side is *consumed* by the swap instead of
+     * detonating. It hands over its color (and, with
+     * `spreadPartnerActivation`, its special kind) and then simply vanishes
+     * from its square — no area of its own, no `repeats`, and no conversion
+     * either, since it's already a special. Its cell still clears, as one of
+     * the `'same-color'` cells.
+     *
+     * This is what a Color Bomb swap actually looks like: the swapped candy
+     * disappears the instant the bomb registers its color, the bomb holds
+     * position while the lightning goes out, and the effect you then see is
+     * the *converted* candies going off — not a bonus row or 3x3 fired from
+     * wherever the partner happened to land.
+     */
+    partnerConsumed?: boolean;
+    /**
+     * `true` = present this combo as one blast shaped like `areas[0]`,
+     * centred on `a`'s cell, instead of as its two participants' individual
+     * special effects. A Striped + Striped cross has to read as a cross; left
+     * to the participants it would draw whatever two stripe directions
+     * happened to be swapped, which is often neither of the lines actually
+     * clearing. Purely presentational — it changes what the renderer is told,
+     * never which cells clear.
+     */
+    presentAsBlast?: boolean;
+    /** `true` = report a Color-Bomb beam from `a`'s cell to every cell this combo's `areas` picked out, for the renderer to draw. */
     beam?: boolean;
+    /** `true` = the beam fires from *both* swapped cells, not just `a` — two Color Bombs each light up the board. */
+    beamFromBothSides?: boolean;
+    /**
+     * Detonate in waves along an axis instead of all at once: `'column'`
+     * sweeps left to right, `'row'` top to bottom. Each targeted cell's beam
+     * bolt and its pop are timed to its own wave, so a whole-board clear reads
+     * as a front crossing the grid rather than one instant blank-out.
+     */
+    sweep?: { axis: 'column' | 'row' };
     /** A second blast at `a`'s cell one phase later, reported as the special `as`. */
     repeat?: { area: AreaSpec; as: SpecialKind };
     /**
@@ -281,29 +341,49 @@ export const rules: GameRules = {
     // Priority-ordered, highest first (again documentation only — `Board.ts`
     // sorts by `priority`). A pair matching no rule here isn't a combo swap.
     combos: [
-        { id: 'bomb+bomb', priority: 100, match: ['color-bomb', 'color-bomb'], areas: [{ shape: 'whole-board' }] },
+        // Both bombs light up the whole board, and it clears as a wave crossing
+        // column by column — not one flat flash, and not a single origin.
+        {
+            id: 'bomb+bomb',
+            priority: 100,
+            match: ['color-bomb', 'color-bomb'],
+            areas: [{ shape: 'whole-board' }],
+            beam: true,
+            beamFromBothSides: true,
+            sweep: { axis: 'column' },
+        },
         {
             id: 'bomb+wrapped',
             priority: 90,
             match: ['color-bomb', 'wrapped'],
             areas: [{ shape: 'same-color' }],
-            spreadPartnerActivation: true,
+            spreadPartnerActivation: {},
+            partnerConsumed: true,
             beam: true,
-            colorSweepAfter: { as: 'wrapped' },
+            // No `colorSweepAfter`: this combo's famous "two waves" are the
+            // converted candies' own double explosion (every wrapped candy
+            // blasts, the board settles, they blast again) — not a second
+            // random color. `candy_crush_rules.md` §4 claims the second-color
+            // wave and secondary guides disagree with each other about it;
+            // King appears to have changed the combo at some point. Confirmed
+            // against the live game 2026-08-25: it is the double detonation.
         },
         {
             id: 'bomb+striped',
             priority: 90,
             match: ['color-bomb', 'striped'],
             areas: [{ shape: 'same-color' }],
-            spreadPartnerActivation: true,
+            // Real Candy Crush hands each converted candy its own stripe
+            // direction, not the swapped tile's — see `stripeOrientation`.
+            spreadPartnerActivation: { stripeOrientation: 'random' },
+            partnerConsumed: true,
             beam: true,
         },
         // Color Bomb + plain candy (or anything with no rule of its own):
         // every tile of that colour goes.
         { id: 'bomb+any', priority: 50, match: ['color-bomb', 'any'], areas: [{ shape: 'same-color' }], beam: true },
         // Full row AND column through the swap point, whatever the two stripes' own orientations were.
-        { id: 'striped+striped', priority: 40, match: ['striped', 'striped'], areas: [{ shape: 'cross' }] },
+        { id: 'striped+striped', priority: 40, match: ['striped', 'striped'], areas: [{ shape: 'cross' }], presentAsBlast: true },
         // 5x5, twice.
         {
             id: 'wrapped+wrapped',
@@ -311,14 +391,28 @@ export const rules: GameRules = {
             match: ['wrapped', 'wrapped'],
             areas: [{ shape: 'box', radius: 2 }],
             repeat: { area: { shape: 'box', radius: 2 }, as: 'wrapped' },
+            presentAsBlast: true,
         },
-        // 3 full rows + 3 full columns; the wrapped half still double-explodes.
+        // 3 full rows + 3 full columns, fired once, but in three beats: the
+        // wrapped half's 3x3 goes off, then the striped half — grown to three
+        // tiles wide — sweeps along its own direction, then across it. Same 39
+        // cells as one flat `band-cross`, sequenced. Deliberately no `repeat`:
+        // candy_crush_rules.md §4 describes this combo as a single giant beam,
+        // not a double explosion — the wrapped half's own double-detonation
+        // rule applies to a wrapped tile going off *as a wrapped tile*, which
+        // is not what this combo does.
         {
             id: 'striped+wrapped',
             priority: 40,
             match: ['striped', 'wrapped'],
-            areas: [{ shape: 'band-cross', radius: 1 }],
-            repeat: { area: { shape: 'box', radius: 1 }, as: 'wrapped' },
+            areas: [
+                { shape: 'box', radius: 1 },
+                { shape: 'row-band', radius: 1 },
+                { shape: 'column-band', radius: 1 },
+            ],
+            stagedAreas: true,
+            orientToPartner: true,
+            presentAsBlast: true,
         },
     ],
 

@@ -31,6 +31,7 @@
  */
 
 import { Node, Tween, Easing, Graphics, ColorRect, BlendMode, Material, ShaderLibrary } from 'noonengine';
+import { theme } from '../config/theme';
 import { NodeContainer, BoardLayout, CellCenter } from './BoardTypes';
 import { AfterTween } from './AsyncUtil';
 import { Burst } from './ParticleBurst';
@@ -125,17 +126,31 @@ function EnsureColorBombBeamShaderRegistered(): void {
     colorBombBeamShaderRegistered = true;
 }
 
-/** How long the beam+ring hold on screen before fading — see `BoardView`'s `COLOR_BOMB_POP_DELAY` doc for why the pop delay it drives must stay under this. */
+/**
+ * Default hold before the beam+ring fade — see `BoardView`'s
+ * `COLOR_BOMB_POP_DELAY` doc for why the pop delay it drives must stay under
+ * this. A caller can pass a shorter `holdDuration` when the beam is one beat
+ * of a longer staged sequence rather than the whole show: a Color Bomb +
+ * striped/wrapped swap converts its targets and detonates them well before
+ * this default would elapse, and a beam still hanging in the air three
+ * seconds after the candies it hit have already exploded reads as a bug.
+ */
 export const LIGHTNING_HOLD_DURATION = 3.7;
 const LIGHTNING_FADE_DURATION = 0.3;
 /**
- * Color Bomb beam palette — aqua with transparency, fixed regardless of the
- * targeted color (unlike the striped/wrapped effects, which tint from
- * `theme.tileTypes[].effectColor`): the Color Bomb's own identity is meant to
- * read as one consistent "energy" effect, not blend into whichever color it
- * happens to be clearing this time.
+ * A swept bolt's own lifetime: how long it stays lit after its wave fires and
+ * how long it takes to fade. A sweep has to read as a *moving front* — each
+ * column lighting up and dying back as the next takes over — not as a fan
+ * that accumulates the whole board's bolts and then vanishes in one go, which
+ * both loses the sense of travel and leaves the beam hanging over candies
+ * that have already been cleared and refilled behind it.
  */
-const COLOR_BOMB_RING_COLOR = 'rgba(0, 225, 255, 0.8)';
+const SWEEP_BOLT_HOLD_DURATION = 0.22;
+const SWEEP_BOLT_FADE_DURATION = 0.18;
+/** Total on-screen life of one swept bolt, from its wave firing — callers size a swept beam's `holdDuration` from this. */
+export const SWEEP_BOLT_LIFETIME = SWEEP_BOLT_HOLD_DURATION + SWEEP_BOLT_FADE_DURATION;
+/** Color Bomb beam palette — `theme.colorBombEffectColor`, fixed regardless of the targeted color; see that field's doc for why it isn't tinted per-color. */
+const COLOR_BOMB_RING_COLOR = theme.colorBombEffectColor;
 
 /**
  * A brief flash of a jittered energy bolt from the Color Bomb's cell to every
@@ -162,54 +177,91 @@ const COLOR_BOMB_RING_COLOR = 'rgba(0, 225, 255, 0.8)';
  * the shared material above. Two contiguous runs — all quads, then all rings
  * — let each batch fully.
  */
-export function SpawnColorBombBeam(parent: NodeContainer, layout: BoardLayout, beam: NonNullable<ResolveResult['colorBombBeam']>): void {
+export function SpawnColorBombBeam(
+    parent: NodeContainer,
+    layout: BoardLayout,
+    beam: NonNullable<ResolveResult['colorBombBeam']>,
+    holdDuration: number = LIGHTNING_HOLD_DURATION,
+    sweepStep = 0
+): void {
     EnsureColorBombBeamShaderRegistered();
-    if (beam.cells.length === 0) return;
+    if (beam.cells.length === 0 || beam.origins.length === 0) return;
     const { tileSize } = layout;
-    const origin = CellCenter(layout, beam.originR, beam.originC);
+    const origins = beam.origins.map(o => CellCenter(layout, o.r, o.c));
     const root = new Node(0, 0);
     parent.addChild(root);
 
-    const targets = beam.cells.map(cell => CellCenter(layout, cell.r, cell.c));
+    const targets = beam.cells.map(cell => ({
+        pos: CellCenter(layout, cell.r, cell.c),
+        // A swept combo lights each wave in turn, so the bolt reaching a cell
+        // arrives on the same beat its candy pops — see `ResolveResult`'s
+        // `cleared[].wave`. `sweepStep` 0 fires the whole fan at once.
+        delay: beam.sweep ? cell.wave * sweepStep : 0,
+    }));
 
     let totalDist = 0;
-    for (const target of targets) totalDist += Math.hypot(target.x - origin.x, target.y - origin.y);
+    for (const target of targets) totalDist += Math.hypot(target.pos.x - origins[0].x, target.pos.y - origins[0].y);
     const sharedMat = new Material('color-bomb-beam', { u_time: 0, u_seed: Math.random() * Math.PI * 2, u_lengthScale: (totalDist / targets.length) / tileSize });
     sharedMat.blend = BlendMode.ADDITIVE;
 
-    for (const target of targets) {
-        const dx = target.x - origin.x;
-        const dy = target.y - origin.y;
-        const dist = Math.hypot(dx, dy);
-        const angleDeg = Math.atan2(dy, dx) * (180 / Math.PI);
-        const mid = { x: (origin.x + target.x) / 2, y: (origin.y + target.y) / 2 };
+    /**
+     * Every node is created up front (one batch, one draw call) and made
+     * visible only when the front reaches it. A swept bolt then dies back on
+     * its own after `SWEEP_BOLT_LIFETIME`, so what's lit at any moment is the
+     * front itself rather than every wave fired so far.
+     */
+    const revealAt = (node: Node, delay: number): void => {
+        if (!beam.sweep) return;
+        node.opacity = 0;
+        Tween.create(node)
+            .delay(delay)
+            .to(0.001, { opacity: 1 }, Easing.linear)
+            .delay(SWEEP_BOLT_HOLD_DURATION)
+            .to(SWEEP_BOLT_FADE_DURATION, { opacity: 0 }, Easing.cubicIn)
+            .start();
+    };
 
-        const beamNode = new Node(mid.x, mid.y);
-        beamNode.width = dist;
-        beamNode.height = tileSize * 0.8;
-        beamNode.rotation = angleDeg;
-        root.addChild(beamNode);
+    // Every bolt from every origin, in one contiguous run — see this
+    // function's doc for why quads and rings must not interleave.
+    for (const origin of origins) {
+        for (const target of targets) {
+            const dx = target.pos.x - origin.x;
+            const dy = target.pos.y - origin.y;
+            const dist = Math.hypot(dx, dy);
+            const angleDeg = Math.atan2(dy, dx) * (180 / Math.PI);
+            const mid = { x: (origin.x + target.pos.x) / 2, y: (origin.y + target.pos.y) / 2 };
 
-        const rect = beamNode.addComponent(ColorRect);
-        rect.material = sharedMat;
+            const beamNode = new Node(mid.x, mid.y);
+            beamNode.width = dist;
+            beamNode.height = tileSize * 0.8;
+            beamNode.rotation = angleDeg;
+            root.addChild(beamNode);
+
+            const rect = beamNode.addComponent(ColorRect);
+            rect.material = sharedMat;
+            revealAt(beamNode, target.delay);
+        }
     }
 
     for (const target of targets) {
-        const ringNode = new Node(target.x, target.y);
+        const ringNode = new Node(target.pos.x, target.pos.y);
         root.addChild(ringNode);
         const ring = ringNode.addComponent(Graphics);
         ring.tessellate = true;
         ring.setLineWidth(tileSize * 0.04);
         ring.drawCircle(tileSize * 0.32, null, COLOR_BOMB_RING_COLOR);
         ring.material.blend = BlendMode.ADDITIVE;
+        revealAt(ringNode, target.delay);
     }
 
-    const driver = Tween.create(root).to(LIGHTNING_HOLD_DURATION, { x: root.x }, Easing.linear);
+    const driver = Tween.create(root).to(holdDuration, { x: root.x }, Easing.linear);
     driver.onUpdate((_target: Node, progress: number) => {
-        sharedMat.uniforms.u_time = progress * LIGHTNING_HOLD_DURATION;
+        sharedMat.uniforms.u_time = progress * holdDuration;
     });
 
-    Burst(parent, origin, COLOR_BOMB_RING_COLOR, { count: 16, lifetime: 0.35, speedMin: 90, speedMax: 200, angleMin: 0, angleMax: Math.PI * 2 });
+    for (const origin of origins) {
+        Burst(parent, origin, COLOR_BOMB_RING_COLOR, { count: 16, lifetime: 0.35, speedMin: 90, speedMax: 200, angleMin: 0, angleMax: Math.PI * 2 });
+    }
 
     AfterTween(driver)
         .then(() => AfterTween(Tween.create(root).to(LIGHTNING_FADE_DURATION, { opacity: 0 }, Easing.cubicIn)))

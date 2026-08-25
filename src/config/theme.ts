@@ -43,6 +43,15 @@ export interface ThemeConfig {
     tileTypes: TileTypeConfig[];
     /** The one colorless Color Bomb frame — not per-type, since a Color Bomb represents no single color. */
     colorBombSpriteKey: string;
+    /**
+     * Tint for effects that belong to no single tile color: the Color Bomb's
+     * beam/rings, and any blast centred on a colorless tile (the whole-board
+     * flash of a Color Bomb + Color Bomb swap). The Color Bomb is meant to
+     * read as one consistent "energy" identity rather than borrowing whichever
+     * color it happens to be clearing, so this is deliberately not derived
+     * from `tileTypes[].effectColor`.
+     */
+    colorBombEffectColor: string;
     sfx: SfxConfig;
 }
 
@@ -70,6 +79,7 @@ export const theme: ThemeConfig = {
     ],
 
     colorBombSpriteKey: 'candy_062',
+    colorBombEffectColor: 'rgba(0, 225, 255, 0.8)',
 
     sfx: {
         swap: 'sfx-swap',

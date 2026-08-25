@@ -9,6 +9,31 @@
  * Crush reference" section (`hasAnyMatch()` false on load, the intended
  * swap producing the intended result) — before adding a new one, verify it
  * the same way rather than by eyeballing the grid.
+ *
+ * ## Combo test matrix
+ *
+ * One row per rule in `rules.ts`'s `combos` table, plus the single-special
+ * activations they're built out of. Load `?layout=<name>`, make the listed
+ * swap, and check the "expect" column — both the cells that clear (the
+ * rule) and the effect that plays (the presentation), since those are two
+ * separate mechanisms and either can regress without the other.
+ *
+ * | `?layout=` | swap | expect |
+ * | --- | --- | --- |
+ * | `striped-h-4match` | (4,2)<->(5,2) | 4-run spawns a **striped-v** at (4,2) — perpendicular to the match |
+ * | `striped-v-4match` | (2,2)<->(2,3) | 4-run spawns a **striped-h** at (2,2) |
+ * | `colorbomb` | (4,2)<->(5,2) | 5-run spawns a **Color Bomb** at (4,2) |
+ * | `colorbomb-beats-wrapped` | (4,2)<->(5,2) | priority check: **Color Bomb**, not Wrapped, despite the crossing 3-run |
+ * | `striped-bystander` | (3,2)<->(4,2) | two beats: row sweep, then the deferred striped-v sweeps its column |
+ * | `wrapped-bystander` | (3,2)<->(4,2) | wrapped caught in a plain match: **3x3** panel, then a second 3x3 one pass later |
+ * | `colorbomb-activate` | (4,4)<->(4,5) | every type-0 candy clears; beam from the bomb's sprite, ring on each target **including the swapped candy** |
+ * | `colorbomb-striped` | (4,4)<->(4,5) | every type-0 candy detonates as a stripe, each with **its own random orientation** (rows *and* columns clear) |
+ * | `colorbomb-wrapped` | (4,4)<->(4,5) | every type-0 candy 3x3-blasts twice, then a **second random color** does the same |
+ * | `colorbomb-colorbomb` | (4,4)<->(4,5) | **whole board** clears under one board-sized flash |
+ * | `combo-striped-striped` | (3,3)<->(3,4) | full row 3 + full column 3 (**15 cells**), drawn as one cross of split stripe trails |
+ * | `combo-wrapped-wrapped` | (3,3)<->(3,4) | **5x5** (rows 1-5, cols 1-5) panel, then the same 5x5 again one pass later |
+ * | `combo-striped-wrapped` | (3,3)<->(3,4) | three beats: 3x3 blast, the candy grows to 3 tiles and sweeps **along its own stripe**, then across it. 39 cells, fired **once**. The giant candy hides for each sweep, returns between them, and never returns after the last |
+ * | `combo-vertical` | (3,3)<->(4,3) | same combo as above through a *vertical* swap (different node-relabelling path) |
  */
 
 import { DebugLayout } from './Board';
@@ -272,6 +297,69 @@ const colorBombVsWrapped: DebugLayout = {
     ],
 };
 
+/**
+ * Striped-h at (3,3) next to striped-v at (3,4) — swap them to fire the
+ * Striped + Striped combo. Deliberately one of each orientation: the combo
+ * clears a full row *and* column regardless of what the two tiles' own
+ * directions were, so a pair that already points both ways can't accidentally
+ * pass a renderer that just draws the participants instead of the cross. The
+ * cross centres on the cell you *pressed*, so pressing (3,3) clears row 3 and
+ * column 3.
+ */
+const comboStripedStriped: DebugLayout = {
+    cells: (() => {
+        const grid = checkerboard(8, 8);
+        grid[3][3] = 4;
+        grid[3][4] = 5;
+        return grid;
+    })(),
+    specials: [
+        ['3,3', 'striped-h'],
+        ['3,4', 'striped-v'],
+    ],
+};
+
+/**
+ * Two wrapped tiles at (3,3)/(3,4) — swap them for the 5x5-twice combo.
+ * Centred at (3,3) the whole 5x5 (rows 1-5, cols 1-5) lands on-board with
+ * nothing clipped, so the blast panel's size can be checked against the grid
+ * directly: it must cover five cells across, not the three a single wrapped
+ * tile takes.
+ */
+const comboWrappedWrapped: DebugLayout = {
+    cells: (() => {
+        const grid = checkerboard(8, 8);
+        grid[3][3] = 4;
+        grid[3][4] = 5;
+        return grid;
+    })(),
+    specials: [
+        ['3,3', 'wrapped'],
+        ['3,4', 'wrapped'],
+    ],
+};
+
+/**
+ * A pre-existing wrapped tile at (4,1) inside a would-be 4-match — swap
+ * (3,2) <-> (4,2) to complete a plain type-0 match at row 4 that includes the
+ * wrapped tile's own cell, so it activates as a caught bystander. The wrapped
+ * counterpart to `stripedBystanderCatch`, and the only layout that exercises a
+ * *lone* wrapped detonation (every other wrapped scenario here goes through a
+ * combo): pass 1 clears the match plus a 3x3 around (4,1), and one pass later
+ * the same 3x3 explodes again — `rules.activation.wrapped.repeats`.
+ */
+const wrappedBystanderCatch: DebugLayout = {
+    cells: (() => {
+        const grid = checkerboard(8, 8);
+        grid[4] = [0, 0, 1, 0, grid[4][4], grid[4][5], grid[4][6], grid[4][7]];
+        grid[3][2] = 0;
+        return grid;
+    })(),
+    specials: [
+        ['4,1', 'wrapped'],
+    ],
+};
+
 export const debugLayouts: Record<string, DebugLayout> = {
     colorbomb: colorBombReady,
     'colorbomb-beats-wrapped': colorBombBeatsWrapped,
@@ -284,4 +372,9 @@ export const debugLayouts: Record<string, DebugLayout> = {
     'striped-h-4match': stripedH4Match,
     'striped-v-4match': stripedV4Match,
     'striped-bystander': stripedBystanderCatch,
+    'wrapped-bystander': wrappedBystanderCatch,
+    'combo-striped-striped': comboStripedStriped,
+    'combo-wrapped-wrapped': comboWrappedWrapped,
+    // Same layout as `combo`, under the name the combo test matrix uses.
+    'combo-striped-wrapped': comboReady,
 };
