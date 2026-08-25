@@ -314,15 +314,19 @@ export class BoardView {
 
     private async _attemptSwap(r1: number, c1: number, r2: number, c2: number): Promise<void> {
         this.busy = true;
+        // One player move starts here — resets the cascade multiplier this
+        // move's passes escalate through (`rules.scoring.cascadeMultipliers`).
+        this.board.beginMove();
 
-        // Must be read before board.swap() — the special (if any) that was
-        // sitting at each original cell. A Color Bomb on either side, or two
-        // specials swapped together, always activates unconditionally; a lone
-        // striped/wrapped special swapped with a plain candy instead follows
-        // the normal match path below (see the comment at its branch).
+        // Read before board.swap() — the special (if any) sitting at each
+        // original cell. Whether this pair is a combo (activates
+        // unconditionally, never reverts) is `rules.combos`' call, not a
+        // hardcoded shape test here: a lone striped/wrapped special swapped
+        // with a plain candy matches no combo rule and so follows the normal
+        // match path below (see the comment at its branch).
         const s1 = this.board.getSpecialAt(r1, c1);
         const s2 = this.board.getSpecialAt(r2, c2);
-        const forcesActivation = s1 === 'color-bomb' || s2 === 'color-bomb' || (s1 !== null && s2 !== null);
+        const forcesActivation = Board.swapActivates(s1, s2);
 
         const n1 = this.nodes[r1][c1]!;
         const n2 = this.nodes[r2][c2]!;
@@ -335,22 +339,24 @@ export class BoardView {
         ]);
 
         if (forcesActivation) {
-            // Color Bomb on either side, or two specials together — always
-            // valid, never reverts. activateSpecialSwap reads the original
-            // cells directly, so the board's own swap() never needs to run
-            // for this path; both original cells always end up cleared
-            // regardless. `this.nodes[r,c]` must still track "whichever node
-            // is currently at grid position (r,c) on screen" though — same
-            // reassignment the normal-match path below does after its own
-            // swap tween, needed here for the same reason: `_runCascade`'s
-            // cleared-cell loop looks nodes up by grid label, and every
-            // burst/pop effect needs to land on the sprite actually sitting
-            // there, not the one that used to be there before this swap.
+            // A combo swap — always valid, never reverts. The model is
+            // swapped first, exactly like the normal match path below, and
+            // only then activated: `activateSpecialSwap` reads both cells as
+            // they now stand, so model coordinates and on-screen sprites
+            // agree about which tile is where. (They didn't always: the combo
+            // used to run against pre-swap coordinates while the sprites had
+            // already traded places, which aimed the Color Bomb's beam at the
+            // bomb's own sprite and left the candy it was swapped with
+            // clearing silently, with no beam and no burst.) `this.nodes` is
+            // relabelled for the same reason — `_runCascade` looks nodes up
+            // by grid label, and every burst/pop effect has to land on the
+            // sprite actually sitting there.
             n1.zIndex = DEFAULT_Z_INDEX;
             n2.zIndex = DEFAULT_Z_INDEX;
+            this.board.swap(r1, c1, r2, c2);
             this.nodes[r1][c1] = n2;
             this.nodes[r2][c2] = n1;
-            const firstResult = this.board.activateSpecialSwap(r1, c1, s1, r2, c2, s2);
+            const firstResult = this.board.activateSpecialSwap(r1, c1, r2, c2);
             await this._runCascade(undefined, firstResult);
             this.movesLeft--;
             this.onMovesChange?.(this.movesLeft);
@@ -436,14 +442,12 @@ export class BoardView {
                 // Fire-and-forget visual flourish — never awaited, so it never
                 // affects cascade pacing. A cleared cell that was a detonating
                 // special gets that special's own burst shape; everything else
-                // gets the plain small burst. A `'color-bomb'`-kind cell is
-                // the *other* candy's own original cell in a Color-Bomb-vs-
-                // plain-candy swap (its grid label doubles as `bombPos`, the
-                // beam's origin — see `Board.activateSpecialSwap`'s doc) —
-                // that candy still needs its own plain burst in its own
-                // color, layered on top of the beam/ring already playing at
-                // that same spot, or it silently clears with no flourish at
-                // all while every other same-color candy elsewhere gets one.
+                // (including every candy a Color Bomb's beam picked out) gets
+                // the plain small burst in its own color. A `'color-bomb'`-kind
+                // cell falls through to that same plain burst deliberately:
+                // the bomb's own cell holds the colorless sentinel id, so
+                // `_spawnPlainBurst` finds no color and skips — the beam
+                // effect already playing from that exact cell is its flourish.
                 const activated = activatedByKey.get(key);
                 if (activated?.kind === 'striped-h' || activated?.kind === 'striped-v') {
                     this._spawnStripedBeam(activated.r, activated.c, activated.typeId, activated.kind === 'striped-h' ? 'h' : 'v');

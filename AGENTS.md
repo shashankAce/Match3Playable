@@ -35,14 +35,48 @@ reskin might want the same *rules* with new art, or the same art with new
 - **`src/config/theme.ts`** — visual/audio identity only: tile sprite/atlas
   keys, SFX asset keys. `tileTypes.length` also implicitly defines the
   tile-type count (never stored as a separate number).
-- **`src/config/rules.ts`** — gameplay rules only: board dimensions
-  (rows/cols), the base match rule (`matching.minMatchLength` — the "3" a
-  clear needs at all), special-tile thresholds/effect sizes
-  (`stripedMatchLength`, `wrappedMatchShape`, `wrappedRadius`),
-  win-condition numbers (move limit / target score), scoring (points per
-  tile). Every number match/clear behavior depends on lives here — see its
-  header comment and AGENTS.md's "Real Candy Crush reference" section below
-  for what's in scope here versus deliberately left out.
+- **`src/config/rules.ts`** — gameplay rules only, and not just loose
+  numbers: it holds the *decisions* `Board.ts` makes, as four ordered
+  tables, so retuning the game never means editing the model. Board
+  dimensions (`board.rows/cols`), the base match rule
+  (`matching.minMatchLength` — the "3" a clear needs at all), then:
+    - **`spawn`** — which special a completed match creates, as
+      priority-ordered pattern rules (`{type:'line', minLength}` /
+      `{type:'intersection'}` → `creates`). A match usually fits several
+      rules at once (a 5-run fits both the 5-line and the 4-line pattern; a
+      crossing pair fits the intersection rule *and* each arm's own line
+      rule), and the explicit `priority` number is the entire tie-break —
+      including "a 5-line beats the L it crosses" and "two 5-lines tie, so
+      both spawn". `creates: 'striped-perpendicular'` carries real Candy
+      Crush's counterintuitive orientation rule; `'striped-aligned'` is
+      there so a reskin can flip it without touching `Board.ts`.
+    - **`activation`** — what one special does when it goes off: the `area`
+      it clears (an `AreaSpec`, see below), how many times it re-detonates a
+      phase later (`repeats` — Wrapped Candy's double explosion),
+      whether another special's blast sets it off (`chainsWhenCaught` —
+      `false` for the Color Bomb), and whether it holds a real color at all
+      (`colorless`).
+    - **`combos`** — what a deliberate swap of two specials does, again
+      priority-ordered (Color Bomb + Color Bomb has to outrank the looser
+      Color Bomb + anything). A pair matching *no* rule here isn't a combo
+      at all and goes through the normal match/revert path — which is
+      exactly what gives a lone striped/wrapped candy swapped with a plain
+      one its three real outcomes, with no special-casing anywhere.
+      `Board.swapActivates()` is the single shared answer to "is this pair a
+      combo?", so the view's revert decision and the model's effect can't
+      disagree.
+    - **`winCondition`** / **`scoring`** — move limit, target score or
+      collect targets; `pointsPerTile`, per-pass `cascadeMultipliers`, and a
+      `specialCreateBonus` per kind.
+
+  Every geometric effect in the game is an `AreaSpec` — one shared shape
+  vocabulary (`row`, `column`, `cross`, `box`, `band-cross`, `same-color`,
+  `whole-board`) used by both `activation` and `combos`, resolved in exactly
+  one place (`Board._areaCells`). "A wrapped tile clears a 3x3" and "two
+  wrapped tiles clear a 5x5" are therefore the same statement with a
+  different radius, not two loops in the model. See `rules.ts`'s header
+  comment and AGENTS.md's "Real Candy Crush reference" section below for
+  what's in scope versus deliberately left out.
 - **`src/game/`** is agnostic to both: board state/model, match detection,
   special-tile (striped/wrapped) logic, swap input handling, board
   rendering/animation, and scene wiring. This code reads values only from
@@ -178,7 +212,7 @@ skipped:
   not implemented. Worth adding before this template ships anywhere real.
 - **Wrapped-tile spawning is confirmed live**, and its detonation area size
   is confirmed correct via the direct `Board`-model tests described in "Real
-  Candy Crush reference" (`_areaFor('wrapped', ...)`, exercised by the
+  Candy Crush reference" (`_areaCells('wrapped', ...)`, exercised by the
   wrapped+wrapped and striped+wrapped combo tests). **Not yet seen live**:
   a wrapped tile detonating via `_catchBystanders`'s passive chain-reaction
   path specifically (i.e. an *ordinary* new match happening to clear a cell
@@ -214,6 +248,36 @@ skipped:
   guide, Unity Ads' playable end-card docs) that every major network's own
   host container draws that control, not the creative; this doc previously
   only had that confirmed for AppLovin/Unity's MRAID path specifically.
+- **Rules turned into data, and the Color-Bomb-swap position bug fixed
+  (2026-08-25)** — two changes, one cause. `Board.activateSpecialSwap()` used
+  to run a combo against *pre-swap* coordinates (`BoardView` deliberately
+  skipped `board.swap()` on that path) while the two sprites had already
+  tweened into each other's cells. Every position it reported was therefore
+  off by one tile: the Color Bomb's beam fired at the bomb's own sprite, and
+  the candy the player swapped in got no bolt, no impact ring and no burst —
+  it just vanished when the pass popped, while every other candy of its color
+  detonated properly. The visible symptom was "the swapped item isn't
+  destroyed". Fixed by making that path swap the model first, exactly like
+  the normal match path, so `activateSpecialSwap(r1, c1, r2, c2)` now reads
+  both cells as they stand (its `s1`/`s2` parameters are gone — it looks the
+  specials up itself). **If you touch this path, keep model and view in
+  agreement: swap, relabel `this.nodes`, then activate.** The same audit
+  turned up the reason such bugs kept recurring — the "which rule wins" and
+  "what does this special do" decisions were `if`-chains inside the model
+  with only their thresholds in `rules.ts`, so priority questions had no
+  single place to live. They're now the `spawn`/`activation`/`combos` tables
+  described under "Config-driven architecture" above, with explicit
+  `priority` numbers, one shared `AreaSpec` vocabulary and one resolver
+  (`Board._areaCells`). Behavior is unchanged except for the position fix
+  and two additions the tables made trivial: `rules.scoring.cascadeMultipliers`
+  / `specialCreateBonus` (a move's cascade is scored by depth now —
+  `Board.beginMove()` resets it, called once per swap), and a Color Bomb +
+  striped/wrapped combo now reports each converted tile's own detonation, so
+  the renderer draws a real beam/burst at each instead of a plain pop.
+  Verified with the standalone `Board`-model method below (31 assertions
+  across all four combos, both spawn conflicts, and the scoring maths) plus a
+  Playwright pass over every `?layout=` combo scene — no console errors, and
+  the swapped candy now visibly takes a bolt, a ring and a burst of its own.
 - **Four rule mismatches against `candy_crush_rules.md` fixed 2026-08-25**,
   found by a direct cross-check of that doc against `Board.ts`/`BoardView.ts`
   (see "Real Candy Crush reference" above for the corrected behavior in each
@@ -238,14 +302,14 @@ skipped:
   *subset* of what cleared, not an exact count, for that reason).
 - **Striped-tile fix corrected again, same day** — the first pass at the
   stripe-direction fix above flipped the wrong side of the mapping: it made
-  `Board._areaFor` clear in the "corrected" direction per-kind, which broke
+  `Board._areaCells` clear in the "corrected" direction per-kind, which broke
   self-consistency with `BoardView.frameKeyFor`'s sprite choice (confirmed by
   cropping `res/candies.png` — see "Special candy creation" above) — a
   horizontal-*looking* striped tile ended up clearing a column, contradicting
   candy_crush_rules.md's own "Blast Effect" rule ("the candy always clears a
   path in the direction its stripes point"). The real fix moves the
   perpendicular mapping to `Board.resolve()`'s two spawn sites instead (which
-  kind a given match orientation spawns), leaving `_areaFor` and
+  kind a given match orientation spawns), leaving the per-kind area lookup (`_areaCells` today, `_areaFor` then) and
   `frameKeyFor` exactly as they always were. Re-verified with the same
   standalone-script method, including two new spawn-side assertions (a
   horizontal run spawns `'striped-v'`, a vertical run spawns `'striped-h'`)
@@ -294,21 +358,24 @@ below). This part matches our v1 scope exactly — the "3" is
   perpendicular part of the rule — *which* kind a given match spawns — lives
   entirely at the two `spawned.push(...)` call sites in `Board.resolve()` (an
   `h`-orientation run spawns `'striped-v'`, a `v`-orientation run spawns
-  `'striped-h'`); `Board._areaFor` and `BoardView.frameKeyFor` never
+  `'striped-h'`); `Board._areaCells` and `BoardView.frameKeyFor` never
   special-case match direction at all, only the kind's own kind string. (An
   earlier pass at this fix, 2026-08-25, made the mistake of flipping
-  `_areaFor`'s own clear-direction-per-kind instead of the spawn-side
+  the area-per-kind lookup's own clear direction instead of the spawn-side
   mapping — which produced the *right* clear direction but broke the Blast
   Effect rule, since it left a horizontal-*looking* tile clearing a column.
   Corrected the same day once caught.)
 - **Wrapped candy** — 5 candies in an L, T, or plus shape (two runs of 3+
   crossing at one cell). Matches our `Board.resolve()`'s h/v-run-intersection
-  merge logic. Its blast radius on detonation (`rules.special.wrappedRadius`,
-  default 1 = a 3x3 area) is a rule knob too, not a hardcoded loop bound.
+  merge logic. Its blast radius on detonation
+  (`rules.activation.wrapped.area`, a `box` of radius 1 = a 3x3 area) is a
+  rule knob too, not a hardcoded loop bound, and its double explosion is
+  `repeats: 1` on that same entry rather than a special case in the model.
 - **Color Bomb** — 5 in a straight line (row or column) of the same color.
-  **Implemented**: `rules.special.colorBombMatchLength` (5), checked before
-  the striped tier in `Board.resolve()` so a 5+ run never falls through to
-  spawning a striped tile instead. Its board-model color is the
+  **Implemented**: `rules.spawn`'s `line-5-color-bomb` rule, whose higher
+  `priority` is what stops a 5+ run falling through to the striped rule (or
+  yielding to an L it happens to cross) — no ordering assumption baked into
+  `Board.resolve()`. Its board-model color is the
   `COLOR_BOMB_TYPE_ID` sentinel (`-2`) — never a real 0..typeCount-1 id — so
   it can never accidentally join or be joined by a normal color run. Its
   single colorless frame is `theme.colorBombSpriteKey` (not per-`TileTypeConfig`,
@@ -347,12 +414,12 @@ game's, not claimed to be pixel-exact except where noted):
 - Striped + Striped → clears a full row *and* column through the swap point
   (`r1,c1`) — 15 cells on an 8-wide/tall board, verified directly against
   `Board`.
-- Striped + Wrapped → the same row+column, but `wrappedRadius`-cells thick
-  in each direction instead of a single line, and (since this combo involves
+- Striped + Wrapped → the same row+column, but thickened to a `band-cross`
+  of radius 1 (3 full rows + 3 full columns) instead of a single line, and (since this combo involves
   a wrapped tile) **also double-explodes** the same way Wrapped+Wrapped does
   below — verified directly.
-- Wrapped + Wrapped → a bigger area, `wrappedRadius * 2` instead of
-  `wrappedRadius` (25 cells at the default radius), that **explodes twice**
+- Wrapped + Wrapped → a bigger area, a `box` of radius 2 instead of the
+  lone wrapped tile's radius 1 (25 cells), that **explodes twice**
   — matches candy_crush_rules.md's "5x5 blast area that explodes twice"
   exactly (previously a single explosion; the second explosion is queued via
   `Board`'s `PendingAction` queue, described below, and fires on the very
